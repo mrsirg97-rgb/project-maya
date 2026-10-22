@@ -3,6 +3,12 @@
 conversation in the model takes the kept one it does continue back, so A, B, A's next turn reads only the new tokens.
 
     python tools/ds4/slot_keep_test.py --pack /mnt/data/models/.../maya-ds4 [--exe build/maya-ds4] [--gpus 0,2,1]
+                                       [--config maya-ds4.json]
+
+The engine gets the environment this test inherits plus, with `--config <maya-ds4.json>`, that config's DeepSeek
+settings (`DS4_*` and the `MAYA_DS4_*` names, under the names the engine reads): on a unified-memory APU the pool it
+sizes from hipMemGetInfo is not the one a config pins (`DS4_POOL_GB`), and there a QUIT can hang for its 300 s.  The
+slot settings this test sets win over the config's - the test decides what it measures.
 
 Six runs of the engine's `--serve` protocol (greedy, spec=0 so the state's position is the answer's, exactly):
   no-keep  A, B, A's next turn (MAYA_DS4_SLOT_KEEP=0)  the reference: reused 0, and its answer to A builds the turn
@@ -36,6 +42,7 @@ answer, or the pack's tokenizer is missing.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import select
 import shutil
@@ -44,21 +51,20 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-try:
-    from strata_tokenizer import Tokenizer  # noqa: E402
-except ImportError as e:   # (tools/strata_tokenizer.py's own: `regex`)
-    sys.exit(f"the tokenizer cannot be imported: {e} (pip install regex)")
+import maya_names  # noqa: E402  (tools/) a model config's settings under the names the engine reads
 
 CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tokenizer_corpus.txt")
 META_MAGIC = 0x314154454d345344   # "DS4META1" (little endian): a slot's .meta, as src/ds4/ds4_main.cpp writes it
+DS4_ENV = ("DS4_", "STRATA_DS4_")   # (the engine's own names: it aliases MAYA_DS4_* to STRATA_DS4_* at start)
 
 
-def text_tokens(tok: Tokenizer, salt: str, n: int) -> list[int]:
-    """`n` tokens of real text: the corpus's passages, each numbered under `salt` (so two prompts diverge at their
-    first words), repeated until long enough and cut at `n`."""
+def text_tokens(tok, salt: str, n: int) -> list[int]:
+    """`n` tokens of real text (through the pack's tokenizer, tools/strata_tokenizer.py): the corpus's passages, each
+    numbered under `salt` (so two prompts diverge at their first words), repeated until long enough and cut at `n`."""
     with open(CORPUS, encoding="utf-8", newline="") as f:   # (CRLF kept: the tokenizer's boundaries depend on it)
         text = f.read()
     out: list[int] = []
@@ -200,12 +206,28 @@ class Engine:
         return lines
 
 
-def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool, steps: list[tuple[str, Callable]],
-        max_new: int, slot_gb: float | None = None) -> tuple[dict, list[str], float]:
-    """One engine process: each step (a name, and a function of the answers so far that gives its prompt) in order."""
-    env = {"MAYA_DS4_SLOT_KEEP": "1" if keep else "0", "MAYA_DS4_SLOT_DIR": slots}
+def config_env(path: str) -> dict[str, str]:
+    """A model config's DeepSeek settings, under the names the engine reads: a unified-memory APU's `DS4_POOL_GB` (its
+    pool is otherwise sized from hipMemGetInfo), the streaming and the tiers it pins."""
+    cfg = maya_names.env_in(json.loads(Path(path).read_text(encoding="utf-8-sig")))   # (a BOM: Notepad)
+    return {k: str(v) for k, v in (cfg.get("env") or {}).items() if k.startswith(DS4_ENV)}
+
+
+def engine_env(settings: dict, keep: bool, slots: str, slot_gb: float | None) -> dict[str, str]:
+    """The engine's environment: the config's settings first, this test's slot settings over them (the test decides
+    what it measures)."""
+    env = dict(settings)
+    env.update({"MAYA_DS4_SLOT_KEEP": "1" if keep else "0", "MAYA_DS4_SLOT_DIR": slots})
     if slot_gb is not None:
         env["MAYA_DS4_SLOT_GB"] = str(slot_gb)
+    return env
+
+
+def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool, steps: list[tuple[str, Callable]],
+        max_new: int, slot_gb: float | None = None, settings: dict | None = None) -> tuple[dict, list[str], float]:
+    """One engine process: each step (a name, and a function of the answers so far that gives its prompt) in order.
+    `settings`: the config's engine settings (config_env), the slot settings here over them."""
+    env = engine_env(settings or {}, keep, slots, slot_gb)
     args = [*(("--gpus", ",".join(str(g) for g in gpus)) if gpus else ()), "--pack", pack, "--max-context", str(ctx),
             "--dspark", "on", "--threads", "on", "--vision", "off", "--expert-profile", "none", "--serve"]
     eng = Engine(exe, args, env)
@@ -236,6 +258,9 @@ def main() -> int:
     ap.add_argument("--exe", default=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__)))), "build", "maya-ds4"), help="the engine (default: <repo>/build/maya-ds4)")
     ap.add_argument("--gpus", default="", help="the GPUs (default: every visible one, the engine's own split)")
+    ap.add_argument("--config", default="", help="a model config (maya-ds4.json): its DS4_/MAYA_DS4_ settings go to the "
+                                                "engine - an APU's DS4_POOL_GB, else its pool is sized from hipMemGetInfo "
+                                                "and its QUIT can hang for 300 s; the slot settings here win over it")
     ap.add_argument("--ctx", type=int, default=32768, help="--max-context")
     ap.add_argument("--len-a", type=int, default=12000, help="A's prompt (tokens)")
     ap.add_argument("--len-b", type=int, default=9000, help="B's prompt (tokens)")
@@ -244,9 +269,15 @@ def main() -> int:
     ap.add_argument("--len-turn", type=int, default=64, help="A's next turn's new tokens")
     ap.add_argument("--max-new", type=int, default=24, help="the answers' length (greedy)")
     a_ = ap.parse_args()
+    settings = config_env(a_.config) if a_.config else {}
 
     if not os.path.exists(a_.exe):
         print(f"{a_.exe}: no engine - build it first (cmake --build build --target maya-ds4)", flush=True)
+        return 2
+    try:
+        from strata_tokenizer import Tokenizer   # (tools/strata_tokenizer.py's own: `regex`)
+    except ImportError as e:
+        print(f"the tokenizer cannot be imported: {e} (pip install regex)", flush=True)
         return 2
     try:
         tok = Tokenizer.from_dir(os.path.join(a_.pack, "tokenizer"))
@@ -278,7 +309,7 @@ def main() -> int:
         print("no-keep: A, B, A's next turn, one process (MAYA_DS4_SLOT_KEEP=0, the reference)", flush=True)
         r0, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-1"), False,
                        [("A", lambda _: a), ("B", lambda _: b),
-                        ("A-turn", lambda ans: a + ans["A"]["tokens"] + turn)], max_new)
+                        ("A-turn", lambda ans: a + ans["A"]["tokens"] + turn)], max_new, settings=settings)
         ref, ref_a = r0["A-turn"], r0["A"]["tokens"]
         print(f"        A {len(a)} tok in {r0['A']['s']:.0f} s, B {len(b)} tok in {r0['B']['s']:.0f} s; A's next turn "
               f"{ref['len']} tok in {ref['s']:.0f} s, reused {ref['reused']}", flush=True)
@@ -287,7 +318,8 @@ def main() -> int:
         print("no-keep: the same prompts once more, a second process (the engine's own run-to-run prompt path)",
               flush=True)
         r0b, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-2"), False,
-                        [("A", lambda _: a), ("B", lambda _: b), ("A-turn", lambda _: a + ref_a + turn)], max_new)
+                        [("A", lambda _: a), ("B", lambda _: b), ("A-turn", lambda _: a + ref_a + turn)], max_new,
+                        settings=settings)
         ref2 = r0b["A-turn"]
         same_a = r0b["A"]["tokens"] == ref_a
         same_turn = ref2["tokens"] == ref["tokens"]
@@ -319,7 +351,8 @@ def main() -> int:
 
         print("in-run: A, B, A's next turn, one process (the slots in RAM)", flush=True)
         r1, _, load1 = run(a_.exe, gpus, a_.pack, a_.ctx, dir_inrun, True,
-                           [("A", lambda _: a), ("B", lambda _: b), ("A-turn", lambda _: a + ref_a + turn)], max_new)
+                           [("A", lambda _: a), ("B", lambda _: b), ("A-turn", lambda _: a + ref_a + turn)], max_new,
+                           settings=settings)
         an, third = r1["A"], r1["A-turn"]
         print(f"        load {load1:.0f} s; A {len(a)} tok in {r1['A']['s']:.0f} s, B {len(b)} tok in "
               f"{r1['B']['s']:.0f} s; A's next turn {third['len']} tok in {third['s']:.1f} s, reused {third['reused']}",
@@ -331,7 +364,7 @@ def main() -> int:
 
         print("kept: A, B, then QUIT (both conversations written to the folder)", flush=True)
         rk, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True,
-                       [("A", lambda _: a), ("B", lambda _: b)], max_new, slot_gb=0.05)
+                       [("A", lambda _: a), ("B", lambda _: b)], max_new, slot_gb=0.05, settings=settings)
         a_answer("kept", rk)
         bins = [f for f in os.listdir(dir_kept) if f.startswith("slot-") and f.endswith(".bin")]
         metas = [f for f in os.listdir(dir_kept) if f.startswith("slot-") and f.endswith(".meta")]
@@ -361,7 +394,7 @@ def main() -> int:
 
         print("restart: A's next turn alone, a new process (the folder's slots)", flush=True)
         r2, notes2, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True,
-                            [("A-turn", lambda _: a + ref_a + turn)], max_new)
+                            [("A-turn", lambda _: a + ref_a + turn)], max_new, settings=settings)
         sr = r2["A-turn"]
         kept = [n for n in notes2 if "kept from earlier runs" in n]
         print(f"        {kept[0] if kept else '(no kept line)'}; reused {sr['reused']} in {sr['s']:.1f} s", flush=True)
@@ -375,7 +408,8 @@ def main() -> int:
         cap_gb = (kept_slots["A"] + kept_slots["B"]) / 2**30
         print(f"evict: A, B, C into a folder capped at A+B's bytes, {cap_gb:.3f} GB (three cannot fit)", flush=True)
         r4, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_evict, True,
-                       [("A", lambda _: a), ("B", lambda _: b), ("C", lambda _: c)], max_new, slot_gb=cap_gb)
+                       [("A", lambda _: a), ("B", lambda _: b), ("C", lambda _: c)], max_new, slot_gb=cap_gb,
+                       settings=settings)
         a_answer("evict", r4)
         evict_slots = folder_slots(dir_evict)
         print(f"        the folder holds '{', '.join(sorted(evict_slots)) or 'nothing'}' "
