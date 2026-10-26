@@ -298,7 +298,8 @@ them.
 
 `--parallel N` (1-8, default 1). `./maya.sh --parallel 4` (Windows:
 `START-MAYA.bat --parallel 4`) keeps it in the config's `"args"`. Maya then answers up to N requests at the same time,
-and the ones after them wait their turn. The dashboard shows how many answers are being written, and `/v1/status`
+and the ones after them wait their turn ([DeepSeek](../docs/SETTINGS.md#deepseek-several-conversations-at-once-parallel)
+has its own section: a conversation a lane of the engine's, pipelined over the split). The dashboard shows how many answers are being written, and `/v1/status`
 reports N as its concurrency.
 - **One GPU:** a token of each request goes through the model together. Every dense weight (the attention
   projections, the shared experts, the dense FFN layers and the output head) is read once for all of them, while the
@@ -619,6 +620,102 @@ pack has no counts yet, so the setup copies `data/expert-profile-ds4.bin` into i
 chat, code, multilingual text, reasoning and tool calls (`tools/ds4/profile.py`). Its counts weigh as much as about
 2,000 tokens of answers, so what your PC routes soon outweighs them. A pack that already has a profile keeps its own;
 an `--expert-profile` in the config's `args` (a file, or `none`) is used instead.
+
+## DeepSeek: several conversations at once (`--parallel`)
+
+`./maya.sh --parallel 3` (`START-MAYA.bat --parallel 3`, or `--parallel` in the config's `args`) keeps up to that many
+requests going at the same time, a conversation each: `1`-`8`, `1` (the default) is the single conversation path as
+before, token for token - `READY` has no `multi=`, a `GEN` carries no `rid`, and pictures, `STOP` and the engine-end
+slot work as they did. It needs a layer split and `--threads on` for N > 1 (a conversation's state and its hand-offs are
+its own, and the serial path has neither), and it is not for `--tp` (each GPU its own layers today; #115's batched step -
+several conversations' tokens through one GPU's step - is the follow-up that a `--tp` user wants). The engine refuses
+these before it loads the model's weights, so a wrong `--parallel` costs a minute, not a load.
+
+**What happens to a token.** A conversation's answer is a token a window, as alone; the difference is that the window is
+enqueued through every layer of the split and its sample left on the last GPU's stream, and the engine does not wait for
+it: it issues the next conversation's window at once (`multi_issue`) and takes a conversation's token only once it is
+there (`multi_take`). So the cards work on different conversations at the same time - the first GPU on C while the last
+one is on A - instead of every card waiting its turn behind one conversation's 100k-token answer. On a split the
+aggregate decode rate can then grow with the number of conversations; how much it does depends on which part of the
+machine is the bottleneck (see the measurement below).
+
+**The mailbox.** A window's request goes to the CPU lane through the engine's mailbox: the layer's device publishes the
+token's routing and its FFN input there, the engine's service thread answers with the part of the experts the CPU lane
+computed, and the layer waits for that answer only before the experts' sum. Each conversation has its own slots in it -
+a slot each of the layers of its window, 40 of them for V4.1 - so a conversation's window, held while another
+conversation's is, never lands on the other's outstanding layers. And the service answers the requests in the order the
+devices publish them, a conversation at a time in turn, not in the order they were issued: a conversation's first layer
+is not held behind another's last. The slots are pinned host memory beside the conversations' states, not out of the
+experts' pool, and the log gives them:
+
+    ds4 multi: the mailbox 3 rings of 40 slots, a conversation's own (126 MB pinned): a conversation's requests and answers never share a slot with another's
+
+(a slot a little over 1 MB, so the 8 conversations of 40 layers the setting allows are ~340 MB; `--parallel 1` keeps
+the one ring it had).
+
+A helper GPU's lane (`DS4_HELPER`) takes the requests one at a time in one number order, which a conversation's own
+numbers do not have: the engine refuses `--parallel` above 1 with a helper GPU (it says so before the weights load).
+
+**The conversations' state.** Each lane holds its own state - the position, every layer's 128-token window ring, the
+compressors' partial groups and the four KV sources' compressed KV and index keys - allocated at start for
+`MAYA_DS4_SEQ_CTX` tokens (Maya-S, a context of 524288 on three GPUs: a lane's state is ~0.7 GB there, its KV rows on
+each GPU that reads them, ~0.18 GB at 131072). It comes out of the expert pool before the pool is sized, and the log's
+`ds4 multi:` line gives it (GLM's `glm multi:` line the same):
+
+    ds4 multi: 3 conversation states: the first for 524288 tokens (0.71 GB), 2 more for 524288 (2.12 GB in all: ...)
+
+A conversation stays in its lane for its next turn (nothing is read again, as with `MAYA_DS4_SLOT_KEEP`); a request that
+arrives when all lanes are busy waits its turn, and a lane's conversation is set aside for that request as the kept
+conversations above are - so `MAYA_DS4_SLOT_KEEP` keeps working per lane (and A, B, C, then A's next turn takes A's
+conversation back).
+
+**What is not the same as alone.** A prompt is read in the same pieces the one-conversation path reads it (windows of 16
+where the chunked path is off, chunks where it is on), and a piece of each prompt being read is taken in turn - a new
+request's prompt no longer waits for the whole of another's 100k-token read before it starts. With the decode gaps
+off, the pieces are the same, so a conversation's greedy answer must be the one it gets alone; `tools/ds4/parallel_test.py`
+checks that token for token with 2 and 4 at once with `MAYA_DS4_PREFILL_GAPS=0` (as the GLM engine's docs say for its
+own `--parallel`), and the reading check with them on. It measures the exceptions first:
+a prompt read twice at `--parallel 1` must answer the same both times - where the expert tiers had to fetch from the
+CPU lane or the SSD and did not the same way twice, an answer is not a function of the prompt alone, and the check then
+compares against both reads. The expert cache's look at its tiers is taken at the round's boundary instead of after every
+window (`MAYA_DS4_MULTI_BOUNDARY`, 32 windows a conversation): an expert moved out of a slot between windows must not
+meet a conversation that is mid-window - a card may be ahead on one conversation while another's token is still being
+taken, and the slots are shared.
+
+**Decode gaps while a prompt is read.** With `--parallel` above 1 and the chunked prompt path, a prompt read pauses at
+its chunk boundaries (every device held at a boundary, the pipeline and the uncut read's chunks kept, the expert pool's
+tail still lent) so that the running conversations decode while it is read. `MAYA_DS4_PREFILL_GAPS=<percent>[,<max gap
+ms>]` sets the share; with `--parallel` above 1 it is on by default at 50 - the equal-share point of GLM's rule (a gap
+as long as the stage that made the running request wait, so the read takes at most twice the uncut time and a request
+decodes half the read's wall). A gap is percent / (100 - percent) of the stage before it, one decode round at least, at
+most 4000 ms; a gap that overruns ends the gaps of that read with one stderr line. A request that arrives while the read
+is paused is admitted and, if its prompt fits a chunk, read in its own lane in windows (a lane's own buffers, not the
+read's staging); a longer one waits its turn. Text prompts only; `--prefill-chunk 0` (windows) or the layer-major read:
+no gaps (the load says so for windows; the layer-major path is not chunked); N=1 is untouched. Inside a gap the expert
+cache does not look at its tiers.
+Not bit-exact: a gap's decode can move experts into spare slots, so a later chunk can find other experts resident,
+staged or on the CPU lane than the uncut read - compare greedy answers with the gaps off. A boundary's gap runs when
+the budget earned since the last gap is half a decode round (the last gap's) or more; `MAYA_DS4_PREFILL_GAP_CREDIT=0`
+runs one at every boundary.
+
+Two consequences to know:
+- the DSpark drafter does not run - every answer is a token a window, no drafts (the load's log says so; `--dspark none`
+  keeps its blocks out of the load, which the drafter's share of VRAM is worth with several conversations);
+- `DS4_PROF`'s per-token line and the DONE line's expert figures are the engine's over the whole time a request ran, so
+  with several conversations they count all of them.
+
+**Measuring it.** `python tools/ds4/parallel_test.py --pack <pack> --measure` runs the checks and prints the table
+(conversations N=1.., prompts of 2,000 and 100,000 tokens, wall time, tokens/s in all and a conversation, and the GPUs'
+mean utilisation while they answer). One conversation's own rate against the GPUs' utilisation is what decides the win:
+where the cards are busy with one conversation already - the experts' pages and the CPU lane being the bottleneck - an
+extra conversation does not add much; where they are not, it does.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_SEQ_CTX` | the context | the tokens each conversation's state after the first reaches (`--parallel N`, N > 1): a lane smaller than the first costs that much less of the expert pool, and a request whose prompt and answer are longer than it is refused. The first conversation's state is for the whole context |
+| `MAYA_DS4_MULTI_BOUNDARY` | 32 | the windows a conversation, times the conversations running, between two of the expert cache's looks at its tiers: at a boundary every issued token is taken back and the cache may move an expert, which no conversation is mid-window over. `0`: never (the cache then waits for the next prompt) |
+| `MAYA_DS4_PREFILL_GAPS` | on at 50 with N > 1 | `<percent>[,<max gap ms>]` (1-90; max 4000 ms): at a chunk boundary of a prompt read the running conversations decode for about percent / (100 - percent) of the stage before it, one round at least. `0` or a malformed value: off. `MAYA_DS4_PREFILL_GAP_CREDIT=0`: a gap at every boundary, a round at least each. Needs the chunked prompt path and `--parallel` above 1; N=1 and the layer-major read are unchanged |
+| `--parallel N` | 1 | the conversations at once, 1-8; `1` is the single path as before. With N > 1 the server's `READY` says `multi=N` and every request's lines carry its `rid` |
 
 ## DeepSeek: conversations kept (an agent's parent and workers on one model)
 

@@ -4,6 +4,27 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased
+
+- **DeepSeek, several conversations at once** (`--parallel N`, 1-8, a layer split with `--threads on`): each
+  conversation has its own state, and its answer's windows are pipelined over the split so the cards work on different
+  conversations at the same time - a request no longer waits for the whole of another's long answer. `1` (the default)
+  is the single conversation path as before, token for token: `READY` has no `multi=`, no `rid`, and pictures, `STOP`
+  and the engine-end slot work as they did. With several, the DSpark drafter does not run and the load's log says so
+  (nor does a helper GPU's lane, which the engine refuses then).
+  `tools/ds4/parallel_test.py` checks and measures it. [docs/SETTINGS.md](docs/SETTINGS.md).
+- **DeepSeek: decode gaps while a prompt is read** (`MAYA_DS4_PREFILL_GAPS`): with `--parallel` above 1 a prompt
+  read pauses at its chunk boundaries so the running conversations keep decoding, and a request that arrives during
+  the read is admitted (a short prompt read in its own lane in windows) instead of waiting for the whole read. The
+  setting is on at 50% (`<percent>[,<max gap ms>]`, 1-90, 4000 ms at most), `0` is off, and N=1 is unchanged. The read
+  takes about twice as long where every expert is in VRAM; not bit-exact, so compare greedy answers with the gaps off.
+  `tools/ds4/parallel_test.py` checks the reading and measures the running conversations' rate. [docs/SETTINGS.md](docs/SETTINGS.md).
+- **DeepSeek: a 512-2047-token prompt no longer goes through windows at a sixth of the speed** on a fresh engine. The
+  choice between the chunked prompt path and windows of 16 modelled a window from its experts' bytes, which left out
+  the fixed costs every window pays on every GPU and the CPU lane's real speed: on a 3-GPU split the second prompt
+  after a start went through windows (100 tokens/s, against 600 in chunks). Windows are now picked from what a full
+  prompt window really took, every one measured (short prompts' too), and the chunked path until one has run.
+
 ## v1.1.28 - 2026-10-25
 
 DeepSeek decodes faster on a single NVIDIA GPU and reaches its full 1M context, the chat stays steady while it writes
