@@ -258,6 +258,9 @@ def main() -> int:
                 print(f"  ERR {e}", flush=True)
         print(f"  turns answered {len(res['turns'])} of {total_turns}; wall {res['wall']:.1f} s; agents done "
               + ", ".join(f"{x:.0f}" for x in res["agents"]) + " s", flush=True)
+        if not firsts:
+            ok = False
+            continue
         print(f"  first token  mean {statistics.mean(firsts):6.2f}  p50 {pct(firsts, 50):6.2f}  p95 {pct(firsts, 95):6.2f}  "
               f"max {max(firsts):6.2f} s", flush=True)
         print(f"  turn done    mean {statistics.mean(dones):6.2f}  p50 {pct(dones, 50):6.2f}  p95 {pct(dones, 95):6.2f}  "

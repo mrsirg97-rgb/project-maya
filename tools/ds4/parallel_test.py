@@ -361,11 +361,12 @@ def main() -> int:
             small_rid = eng.send(small, 16, a.spec)
             got = eng.stream(small_rid)
             first_t = got["times"][0] if got["times"] else float("inf")
-            # the long prompt's own PP lines tell when its read was done
-            big_pp = []
+            # the long prompt's own PP lines tell when its read was done: the one whose tokens done reach its total
+            # (none yet: the read is still going)
             with eng.cond:
-                big_pp = [t for k, l, t in eng.got.get(long_rid, []) if k == "PP"]
-            read_end = big_pp[-1] if big_pp else float("inf")
+                big_end = [t for k, l, t in eng.got.get(long_rid, [])
+                           if k == "PP" and int(l.split()[2]) >= int(l.split()[3])]
+            read_end = big_end[0] if big_end else float("inf")
             early = len([t for t in got["times"] if t < read_end])
             check(f"reading: {early} of the small answer's {len(got['times'])} tokens came before the long read's "
                   f"last piece", early > 0 and got["generated"] == 16)

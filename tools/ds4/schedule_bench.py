@@ -4,10 +4,10 @@ first send.
 
     python tools/ds4/schedule_bench.py --pack <pack> [--exe build/maya-ds4] [--gpus 0,2,1] [--config maya-ds4.json]
 
-  order     sent at once, longest first: MAYA_DS4_READ_ORDER=arrival against the default (the highest response ratio)
+  order     sent at once, longest first: MAYA_DS4_READ_ORDER=arrival and =ratio against the default (a piece each)
   during    the 16,000-token one first, the others 1.5 s later (they arrive while it is read): the default
-  answers   at once, the 250-token one asking for a 200-token answer: MAYA_DS4_PREFILL_GAPS=50 against the default
-            (shortest remaining work first)
+  answers   at once, the 250-token one asking for a 200-token answer, read by ratio: MAYA_DS4_PREFILL_GAPS=50 against
+            the default gaps (shortest remaining work first)
 
 Each run's slots go to a scratch MAYA_DS4_SLOT_DIR (MAYA_DS4_SLOT_KEEP=0).  Exit 0: every run answered every request.
 """
@@ -105,10 +105,12 @@ def main() -> int:
             if k not in ("MAYA_DS4_PREFILL_GAPS", "MAYA_DS4_READ_ORDER")}
     prompts = [text_tokens(tok, f"Schedule {i}.", n) for i, n in enumerate(LENS)]
     arrival = dict(base, MAYA_DS4_READ_ORDER="arrival")
-    fixed = dict(base, MAYA_DS4_PREFILL_GAPS="50")
+    ratio = dict(base, MAYA_DS4_READ_ORDER="ratio")
+    fixed = dict(ratio, MAYA_DS4_PREFILL_GAPS="50")
     long_answer = [NEW, NEW, NEW, 200]
     ok = table("order: at once, longest first", [
         ("first come, first served", run(a, prompts, arrival, 0.0, [NEW] * 4)),
+        ("highest response ratio", run(a, prompts, ratio, 0.0, [NEW] * 4)),
         ("default", run(a, prompts, base, 0.0, [NEW] * 4)),
     ])
     ok = table("during: the 16,000-token one first, the rest 1.5 s later", [
@@ -116,7 +118,7 @@ def main() -> int:
     ]) and ok
     ok = table("answers: at once, the 250-token one's answer 200 tokens", [
         ("gaps fixed at 50%", run(a, prompts, fixed, 0.0, long_answer)),
-        ("default", run(a, prompts, base, 0.0, long_answer)),
+        ("default gaps", run(a, prompts, ratio, 0.0, long_answer)),
     ]) and ok
     print("\nevery run answered every request" if ok else "\na run failed (the reason is in its row)", flush=True)
     return 0 if ok else 1

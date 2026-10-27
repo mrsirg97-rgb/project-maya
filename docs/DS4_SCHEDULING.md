@@ -35,16 +35,37 @@ and assumed the GPUs were idle then.
 
 **A request past the N states** waits for a lane (it used to be answered with ERR).
 
-## Which prompt is read next: the highest response ratio
+## Which prompt is read next: a piece each, in turn
 
-One read at a time; the next is the **highest response ratio**: `(wait + read) / read`, `read` the prompt's tokens
-left at the last read's measured rate. Waiting alike, the shortest goes first - which minimises the mean wait - and a
-long prompt's ratio grows as it waits, so a stream of short ones does not starve it. No constant: the rate is
-measured, the wait is the clock's.
+One read at a time. By default the prompts being read take turns a **piece** each - a chunk for each of the split's
+pipeline stages (3 chunks on three GPUs: every stage busy) - and a prompt that has a piece left goes to the back of the
+line. A prompt whole in one piece joins the line ahead of the longer reads (behind the other one-piece prompts): it is
+through in its turn, so a 256-token question during a 100,000-token read waits for the piece being read, not a round of
+them - all 16 of its answer tokens came before the long read was through (none did without it), and the agent workload
+below came out the same with and without it. Before each piece the conversations answering get a token each. Nothing
+is guessed: no prompt's size is weighed against another's beyond "one piece or more", a short one is through in its
+turn, and a long one moves forward every turn instead of waiting for a gap in the short ones.
 
-Four requests sent at once, longest first, `MAYA_DS4_READ_ORDER=arrival` against the default (same build):
+On an agent workload (`tools/ds4/agent_bench.py`: 4 agents of 8 turns at once - a 4,000-12,000-token first prompt, then
+tool results of 150-2,000 tokens, one in ten 5,000-20,000 - answers of 64-400 tokens, 0.5-5 s of tool time between):
 
-| Prompt (tokens) | First come, first served: first token / done (s) | Default: first token / done (s) |
+| Read order (same build, adaptive gaps unless said) | First token mean / p95 (s) | Turn done mean / p95 (s) | Wall (s) |
+| --- | ---: | ---: | ---: |
+| first come, first served (`arrival`) | 17.3 / 38.7 | 32.1 / 58.3 | 292 |
+| highest response ratio, a read waiting while an answer would end first | 20.6 / 58.7 | 36.9 / 85.5 | 330 |
+| before the events (`--parallel` alone, fixed 50% gaps) | 7.6 / 25.2 | 31.4 / 53.7 | 278 |
+| a piece each, fixed 50% gaps | 7.6 / 25.5 | 31.4 / 53.7 | 278 |
+| **a piece each (default)** | **6.5 / 17.2** | **29.6 / 46.2** | **266** |
+
+Agents' prompts are mostly short continuations, so a prompt's size says little about how soon its agent is unblocked;
+taking turns serves them all at once, and the adaptive gaps keep the answers running between the pieces.
+
+`MAYA_DS4_READ_ORDER=ratio` reads the **highest response ratio** next instead: `(wait + read) / read`, `read` the
+prompt's tokens left at the last read's measured rate - waiting alike, the shortest goes first, and a long prompt's
+ratio grows as it waits, so a stream of short ones does not starve it. It wins where a few prompts of very different
+sizes arrive at once; four requests sent together, longest first, against `arrival` (32-token answers):
+
+| Prompt (tokens) | First come, first served: first token / done (s) | Highest response ratio: first token / done (s) |
 | ---: | ---: | ---: |
 | 250 | 28.4 / 30.3 | 2.9 / 3.9 |
 | 1,000 | 25.8 / 30.2 | 7.7 / 8.9 |
@@ -52,12 +73,10 @@ Four requests sent at once, longest first, `MAYA_DS4_READ_ORDER=arrival` against
 | 16,000 | 11.0 / 15.2 | 24.4 / 25.4 |
 | mean | 21.8 / 26.4 | 12.1 / 13.2 |
 
-All four done after 30.3 and 25.4 s. The long one waits for the short ones - the trade.
+## Between a read's chunks: shortest remaining work first
 
-## Between a read and the answers: shortest remaining work first
-
-The same question comes up at every point a read could start or go on: read now, or let the running answers
-decode? The engine answers it one way everywhere - **the shortest remaining work first**:
+At every chunk boundary of a read the question is: read on, or let the running answers decode? The engine answers it
+with **the shortest remaining work first**:
 
 - the read's remaining time: its tokens left at its measured rate (the read's own so far, from its progress);
 - an answer's: its expected tokens left at a decode round's measured time (a round: a token for every conversation
@@ -66,9 +85,8 @@ decode? The engine answers it one way everywhere - **the shortest remaining work
   likely to run);
 - the answers go first while the soonest of them would end before the read does.
 
-Before each read the answers get a round (which measures one); at a read's chunk boundaries the same rule makes the
-**decode gaps** (a round at least, each round measuring them again, 4000 ms at most). With the 250-token request's
-answer at 200 tokens:
+These are the **decode gaps** (a round at least, each round measuring them again, 4000 ms at most). On the four
+requests above, read by response ratio, with the 250-token request's answer at 200 tokens:
 
 | Gaps | Mean first token (s) | Mean done (s) | All done (s) |
 | --- | ---: | ---: | ---: |
@@ -77,6 +95,34 @@ answer at 200 tokens:
 
 The rule minimises the mean time to a whole answer - an agent waits for the whole answer before it acts on it -
 at some cost to the first token of the prompts after a long answer.
+
+## Answering with the drafter
+
+A conversation that drafts (`spec`, or the engine's `--dspark on`) answers in **rounds**: the one-conversation path's
+round on its lane - the DSpark drafter's drafts while their confidence holds, verified in one window, the thinking
+budget as there. A round asks for every GPU (`want_devices`) the way a read does, so it takes its turn with the reads
+and the other drafting conversations; a read's gap gives each one a round. The drafter's mailbox requests are numbered
+per conversation, and a conversation's verify window uses its own lane's buffers, so none touches a paused read's
+staging. Exact: a drafting conversation answers what it answers alone, at 2 and 4 lanes.
+
+On the real traffic below the drafter is most of the win: the same build without it took 882 s.
+
+## On real agent traffic
+
+`agent_bench.py --trace` replays rig's `.served` log: the busiest 10 minutes of four conversations (73 turns, a turn's
+new tokens 1-20,653, median 235; one conversation 217,222 tokens deep), with their real gaps between turns. Against
+v1.1.28 as it runs today - one conversation at a time, the drafter on, conversations kept:
+
+| | v1.1.28, one at a time | `--parallel` alone (before the events) | this: a piece each + drafter rounds |
+| --- | ---: | ---: | ---: |
+| first token, mean / p50 / p95 (s) | 9.19 / 4.80 / 33.7 | 2.63 / 1.73 / 7.73 | **1.92 / 1.38 / 6.00** |
+| turn done, mean / p50 / p95 (s) | 14.2 / 8.24 / **36.3** | 22.5 / 9.78 / 83.5 | **13.1 / 6.05** / 48.1 |
+| wall (s) | **496** | 874 | 509 |
+
+The first token comes 4.8x sooner on the mean and 5.6x at p95; a turn is done 27% sooner at the median. The same
+work in about the same wall time - the GPUs are as busy as one conversation keeps them, the turns no longer wait in a
+line. The cost is the longest turns: p95 done 48.1 s against 36.3, a long answer sharing the GPUs instead of having
+them.
 
 ## A short prompt that comes during a long read
 
@@ -100,6 +146,8 @@ Kept here because each one looked right:
 | Cutting short reads into 4 chunks (so they have gap points, as GLM's `MAYA_GLM_PREFILL_MIN_CHUNKS`) | a 4,000-token read ~12 s instead of ~4 s; four 2,000-token reads 27 s instead of 16 | a chunk streams every expert its rows route to - about as many for 1,000 rows as for 4,000 - so where they do not all fit in VRAM a cut read streams them again a chunk. Off by default (`MAYA_DS4_PREFILL_MIN_CHUNKS`); where every expert is in VRAM a chunk's cost follows its rows |
 | Fixed gap shares of 50, 20, 10% | the reads took as long at every share; lower shares only starved the answers (a 250-token answer done at 13, 31 s) | the cost was the chunks', not the gaps' |
 | Shortest first, aged by "waited longer than its own read" | prompts arriving during a long read were read in arrival order | every short prompt behind a long read has waited longer than its own read: all aged, so all first come, first served. The response ratio replaced it |
+| The highest response ratio by default, a read waiting while an answer would end first | on the agent workload the worst of all: first token 20.6 s on the mean (7.6 before the events) | an agent's next prompt is short and comes right after its answer; holding reads for answers and weighing sizes kept the long reads waiting in pieces. A piece each replaced it |
+| A drafting conversation's drafts and verify windows in flight beside the others' windows (the drafter on its own streams, rollback buffers a lane) | exact, drafting 3 ms a round instead of 75 - and no faster: 4 agents x 2 turns in 74.9 s against 72.3 in rounds | about half of GSQ's experts are on the CPU lane, which every conversation's windows share; the rounds already keep it busy. Where every expert is in VRAM it may pay |
 | Choosing the read when a request is admitted | shortest first made no difference: the first request's read began before the others were admitted | the choice is an event of its own now, below the lines |
 
 ## Bugs found on the way
@@ -117,4 +165,7 @@ Kept here because each one looked right:
 
     python tools/ds4/parallel_test.py --pack <pack> --lanes 4             # exactness, stop, slots, reading
     python tools/ds4/parallel_test.py --pack <pack> --lanes 4 --measure   # + the throughput table
-    python tools/ds4/schedule_bench.py --pack <pack>                      # the tables above
+    python tools/ds4/schedule_bench.py --pack <pack>                      # the response ratio and gap tables
+    python tools/ds4/agent_bench.py --pack <pack> --exe build/maya-ds4    # the agent workload (--spec: drafting)
+    python tools/ds4/agent_bench.py --pack <pack> --exe build/maya-ds4 --trace <rig .served> --spec
+    python tools/ds4/agent_bench.py --pack <pack> --exe <v1.1.28 build> --trace <rig .served> --serial

@@ -679,26 +679,24 @@ request that came is admitted before the next read is chosen. Work that needs ev
 cache's boundary - asks for them (`want_devices`): the conversations' next tokens wait while their issued ones come back,
 it runs, and they are issued again. Nothing polls.
 
-**Which prompt is read next.** One read at a time (it has every GPU); the next is the **highest response ratio**:
-(its wait + its read) / its read, its read the tokens it has left at the last read's measured rate. Waiting alike, the
-shortest goes first - the least waiting in all - and a long prompt's ratio grows as it waits, so a stream of short ones
-does not starve it. Before each read the conversations answering get a token each (a round, which also measures their
-rate), and then the read waits while the soonest answer would end before the read does (shortest remaining work first,
-the rule the decode gaps below use too) - an answer's length expected from the answers ended so far (its `max_new` at
-most), or as many tokens again as it has once it is past that. `MAYA_DS4_READ_ORDER=arrival` reads them first come,
-first served instead (to compare). Four requests at once on a 3-GPU split (GSQ, 32-token answers), sent longest first:
+**Which prompt is read next.** One read at a time (it has every GPU). By default the prompts being read take turns a
+**piece** each - a chunk for each of the split's pipeline stages, so every stage is busy - and one with a piece left
+goes to the back of the line - a prompt whole in one piece joins it ahead of the longer reads, so a short question
+during a long read waits for one piece, not a round of them; before each piece the conversations answering get a
+token each (a round, which also
+measures their rate). No prompt's size is guessed: a short one is through in a turn or two, a long one moves forward
+every turn. On an agent workload (4 agents of 8 turns at once, mostly short tool results, `tools/ds4/agent_bench.py`)
+the first token came in 6.5 s on the mean (17.2 at p95) and a turn was done in 29.6 s, against 17.3 / 32.1 first come,
+first served. `MAYA_DS4_READ_ORDER=ratio` reads the **highest response ratio** next instead - (its wait + its read) /
+its read, its read the tokens it has left at the last read's measured rate: waiting alike, the shortest first, and a
+long one's ratio grows as it waits - which wins where a few prompts of very different sizes come at once (four sent
+together, 16K / 4K / 1K / 250 tokens: the 250 answered whole in 3.9 s, 30.3 s first come, first served; the mean done
+13.2 s, 26.4). `arrival` reads them first come, first served (as before the event loop; to compare).
 
-| Prompt (tokens) | First come, first served: first token / done (s) | Shortest remaining work first: first token / done (s) |
-| ---: | ---: | ---: |
-| 250 | 28.4 / 30.3 | 2.9 / 3.9 |
-| 1,000 | 25.8 / 30.2 | 7.7 / 8.9 |
-| 4,000 | 22.1 / 30.1 | 13.4 / 14.4 |
-| 16,000 | 11.0 / 15.2 | 24.4 / 25.4 |
-| mean | 21.8 / 26.4 | 12.1 / 13.2 |
-
-All four were done after 30.3 s and 25.4 s. The long prompt waits for the short ones, which is the trade: a request is
-answered whole in about the time its own prompt takes to read. With the 16,000-token one sent 1.5 s before the others
-(they arrive while it is read), their first tokens came 13.7 / 18.9 / 24.6 s after the first send, the mean done 19.0 s.
+On rig's real traffic (four conversations' busiest 10 minutes, 73 turns, replayed by `agent_bench.py --trace`), against
+v1.1.28 at `--parallel 1` with the drafter and conversations kept: the first token 1.9 s on the mean (9.2) and 6.0 at
+p95 (33.7), a turn done 6.1 s at the median (8.2) and 13.1 on the mean (14.2), the wall 509 s (496); the longest turns
+take longer (p95 done 48.1 s, 36.3), a long answer sharing the GPUs.
 
 **A request past the N states** waits for a lane (in the order they came), where the engine used to answer it with ERR.
 How each rule was chosen, what was tried and did not work, and the tables' script: [DS4_SCHEDULING.md](DS4_SCHEDULING.md).
@@ -717,13 +715,13 @@ taken, and the slots are shared.
 
 **Decode gaps while a prompt is read.** With `--parallel` above 1 and the chunked prompt path, a prompt read can pause
 at its chunk boundaries (every device held at a boundary, the pipeline and the uncut read's chunks kept, the expert
-pool's tail still lent) so that the running conversations decode while it is read. By default the gaps are the same rule
-as the choice between reads: at a boundary, the answers decode while the soonest one would end before the rest of the
+pool's tail still lent) so that the running conversations decode while it is read. By default a gap is the shortest
+remaining work first: at a boundary, the answers decode while the soonest one would end before the rest of the
 read does - a round at least, each round measuring them again, 4000 ms at most - and the read goes on once no answer
 would. A nearly finished answer then gets its end before a long read, and a long answer that has just begun does not
 stretch a short one. `MAYA_DS4_PREFILL_GAPS=<percent>[,<max gap ms>]` takes a fixed share instead (GLM's rule: a gap is
-percent / (100 - percent) of the stage before it, one decode round at least): on the four requests above with a 200-token
-answer for the 250, the adaptive gaps finished them on the mean in 18.6 s, a fixed 50% in 24.9 s. A gap that overruns
+percent / (100 - percent) of the stage before it, one decode round at least): on the four requests above (read by response ratio) with a
+200-token answer for the 250, the adaptive gaps finished them on the mean in 18.6 s, a fixed 50% in 24.9 s. A gap that overruns
 its most ends the gaps of that read with one stderr line. A request that arrives while the read is paused is admitted;
 if its prompt fits a chunk it is read in its own lane in windows (a lane's own buffers, not the read's staging) only
 where that is measured quicker than its turn in chunks after the read - its windows at what a prompt window took here
@@ -741,8 +739,10 @@ the budget earned since the last gap is half a decode round (the last gap's) or 
 runs one at every boundary.
 
 Two consequences to know:
-- the DSpark drafter does not run - every answer is a token a window, no drafts (the load's log says so; `--dspark none`
-  keeps its blocks out of the load, which the drafter's share of VRAM is worth with several conversations);
+- a conversation that drafts (`spec`, or `--dspark on`) answers in DSpark rounds - the one-conversation path's round on
+  its lane, drafts verified in one window - each round taking every GPU in turn with the reads (a read's gap gives it a
+  round), and its answer is the one it gets alone. On the real traffic above the drafter took the wall from 882 s to
+  509. One that does not draft answers a token a window, pipelined with the others;
 - `DS4_PROF`'s per-token line and the DONE line's expert figures are the engine's over the whole time a request ran, so
   with several conversations they count all of them.
 
@@ -757,7 +757,7 @@ extra conversation does not add much; where they are not, it does.
 | `MAYA_DS4_SEQ_CTX` | the context | the tokens each conversation's state after the first reaches (`--parallel N`, N > 1): a lane smaller than the first costs that much less of the expert pool, and a request whose prompt and answer are longer than it is refused. The first conversation's state is for the whole context |
 | `MAYA_DS4_MULTI_BOUNDARY` | 32 | the windows a conversation, times the conversations running, between two of the expert cache's looks at its tiers: at a boundary every issued token is taken back and the cache may move an expert, which no conversation is mid-window over. `0`: never (the cache then waits for the next prompt) |
 | `MAYA_DS4_PREFILL_GAPS` | unset: adaptive, with N > 1 | unset: at a chunk boundary of a prompt read the running conversations decode while the soonest answer would end before the read does (shortest remaining work first; a round at least, 4000 ms at most). `<percent>[,<max gap ms>]` (1-90; max 4000 ms): a fixed share instead - about percent / (100 - percent) of the stage before it, one round at least (`MAYA_DS4_PREFILL_GAP_CREDIT=0`: a gap at every boundary). `0` or a malformed value: off. Needs the chunked prompt path and `--parallel` above 1; N=1 and the layer-major read are unchanged |
-| `MAYA_DS4_READ_ORDER` | the highest response ratio | `arrival`: the prompts waiting are read first come, first served (as before the event loop; to compare). Otherwise the highest (wait + read) / read next, and a read waits while an answer would end before it |
+| `MAYA_DS4_READ_ORDER` | `pieces` | `pieces`: the prompts being read take turns, a chunk each of the split's pipeline stages a turn. `ratio`: the highest (wait + read) / read next, read whole. `arrival`: first come, first served (as before the event loop; to compare) |
 | `MAYA_DS4_PREFILL_MIN_CHUNKS` | off | `<n>[,<min tokens>]` (2-8, 512 tokens at least): with the gaps on, a read while other conversations answer is cut into n chunks at least, so a prompt of one chunk has boundaries for gaps. Off by default: a chunk streams every expert its rows route to, about as many for 1,000 rows as for 4,000, so where the experts do not all fit in VRAM a cut read streams them again a chunk (a 3-GPU split, GSQ: a 4,000-token read ~12 s in four chunks, ~4 s in one, at gap shares of 50, 20 and 10% alike). Where every expert is in VRAM a chunk's cost follows its rows. Not bit-exact, as `--prefill N` is not |
 | `--parallel N` | 1 | the conversations at once, 1-8; `1` is the single path as before. With N > 1 the server's `READY` says `multi=N` and every request's lines carry its `rid` |
 

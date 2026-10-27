@@ -125,7 +125,7 @@ public:
     /// than its turn in chunks).
     int window_rows() const;
     /// The split's pipeline stages (its groups of GPUs, one after another): a read of that many chunks keeps them all
-    /// busy - the multi loop's read pieces (MAYA_DS4_READ_ORDER=pieces) are that many chunks.
+    /// busy - the multi loop's read pieces (MAYA_DS4_READ_ORDER's default) are that many chunks.
     int pipeline_stages() const;
     double window_s() const;
     /// The decode gaps of a prompt read (MAYA_DS4_PREFILL_GAPS), and the gap the serve loop runs at a boundary:
