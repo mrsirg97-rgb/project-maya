@@ -15241,6 +15241,50 @@ struct Model::Impl {
         return ok;
     }
 
+    // a prompt run's flow on device di, from its first layer: its streams idle, its items and counters reset, the
+    // layers it holds, the run's chunks and YOCO cut, and its first layer's experts asked for (flow_spec)
+    bool flow_begin(int di, const Run& run, std::string& err) {
+        Chunk& c = *chunks[(size_t) di];
+        CK(cudaStreamSynchronize(devs[(size_t) di].st));
+        CK(cudaStreamSynchronize(c.cs));
+        c.items.clear();
+        c.base = c.n_read = c.n_dma = c.n_comp = 0;
+        c.n_file = 0;
+        std::fill(c.stage_item.begin(), c.stage_item.end(), -1);
+        c.fl_layers.clear();
+        for (int il = 0; il < g.nl; ++il)
+            for (int m = 0; m < L[(size_t) il].nm; ++m)
+                if (member(L[(size_t) il], m).dev == di) c.fl_layers.push_back(il);
+        c.fl_T = run.T;
+        c.fl_yoco = run.yoco;
+        c.fl_cut_k = run.cut_k;
+        c.fl_cut_r = run.cut_r;
+        c.spec_k = c.spec_il = -1;
+        c.wait_ms = 0;
+        c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = c.it_helper = c.chk_n = 0;
+        c.lc_il = -1;
+        c.lc_used = 0;
+        c.lc_first = c.lc_chk = 0;
+        c.io_d0 = c.io->direct_bytes();
+        c.io_b0 = c.io->buffered_bytes();
+        c.io_h0 = c.io->device_bytes();
+        // (a short prompt's reads through the page cache, which keeps them for the decode after it - as the CPU
+        // lane's reads in windows did: one V100, Maya-S from an NVMe, decode after 17 tokens 12.7 tokens/s read
+        // past the cache, 14.0 after windows; a long one's past it, more than the cache holds - DS4_FLOW_BUFFERED,
+        // 1024 tokens on one GPU, 0 on more: the longest run read through it)
+        static const int buf_max = std::getenv("DS4_FLOW_BUFFERED") ? std::atoi(std::getenv("DS4_FLOW_BUFFERED"))
+                                                                    : devs.size() == 1 ? 1024 : 0;
+        int run_n = 0;
+        for (int t : run.T) run_n += t;
+        c.buffered = run_n <= buf_max;
+        if (!c.fl_layers.empty()) {
+            // A group starting at the YOCO source has only KV work before the cut: no flow_layer to advance it.
+            const int il = c.fl_layers[0], k = run.yoco >= 0 && il >= run.yoco ? run.cut_k : 0;
+            flow_spec(c, k, il, fl_rows(c, k, il));
+            if (!flow_pump(c, err)) return false;
+        }
+        return true;
+    }
     // layer-major (c.lm: a run of several chunks, device di every trunk layer, the flow set up by run_dev_chunks):
     // layer after layer, each through all the chunks in order - a chunk's state to host memory after each of its
     // layers and back before the next - so a layer's experts are read from the files once for the whole run (the
@@ -15362,7 +15406,6 @@ struct Model::Impl {
         Chunk& c = *chunks[(size_t) di];
         RunDev& r = *rdv[(size_t) di];
         cudaSetDevice(d.id);
-        cudaStream_t s = d.st;
         const int nk = (int) run.T.size();
         if (r.ra_started) {
             r.ra_stop.store(true);
@@ -15383,43 +15426,7 @@ struct Model::Impl {
         r.stream_start = c.stream_bytes;
         const int B = std::max(1, c.ring_n / Chunk::kParts);
         if (c.flow) {   // (the flow decides its streams as the layers route; nothing planned here)
-            CK(cudaStreamSynchronize(s));
-            CK(cudaStreamSynchronize(c.cs));
-            c.items.clear();
-            c.base = c.n_read = c.n_dma = c.n_comp = 0;
-            c.n_file = 0;
-            std::fill(c.stage_item.begin(), c.stage_item.end(), -1);
-            c.fl_layers.clear();
-            for (int il = 0; il < g.nl; ++il)
-                for (int m = 0; m < L[(size_t) il].nm; ++m)
-                    if (member(L[(size_t) il], m).dev == di) c.fl_layers.push_back(il);
-            c.fl_T = run.T;
-            c.fl_yoco = run.yoco;
-            c.fl_cut_k = run.cut_k;
-            c.fl_cut_r = run.cut_r;
-            c.spec_k = c.spec_il = -1;
-            c.wait_ms = 0;
-            c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = c.it_helper = c.chk_n = 0;
-            c.lc_il = -1;
-            c.lc_used = 0;
-            c.lc_first = c.lc_chk = 0;
-            c.io_d0 = c.io->direct_bytes();
-            c.io_b0 = c.io->buffered_bytes();
-            c.io_h0 = c.io->device_bytes();
-            // (a short prompt's reads through the page cache, which keeps them for the decode after it - as the CPU
-            // lane's reads in windows did: one V100, Maya-S from an NVMe, decode after 17 tokens 12.7 tokens/s read
-            // past the cache, 14.0 after windows; a long one's past it, more than the cache holds - DS4_FLOW_BUFFERED,
-            // 1024 tokens on one GPU, 0 on more: the longest run read through it)
-            static const int buf_max = std::getenv("DS4_FLOW_BUFFERED") ? std::atoi(std::getenv("DS4_FLOW_BUFFERED"))
-                                                                        : devs.size() == 1 ? 1024 : 0;
-            int run_n = 0;
-            for (int t : run.T) run_n += t;
-            c.buffered = run_n <= buf_max;
-            if (!c.fl_layers.empty()) {
-                const int il = c.fl_layers[0], k = run.yoco >= 0 && il >= run.yoco ? run.cut_k : 0;
-                flow_spec(c, k, il, fl_rows(c, k, il));
-                if (!flow_pump(c, err)) return false;
-            }
+            if (!flow_begin(di, run, err)) return false;
             if (c.lm) {
                 err = "layer-major prompts have no decode gaps (the pause would be at a layer, not a chunk)";
                 return false;
@@ -15641,46 +15648,13 @@ struct Model::Impl {
         }
         // layer-major: the flow's buffers, then all the layers one GPU at a time (no decode gaps here: the pause
         // would be at a layer, not a chunk boundary)
-        Dev& d = devs[(size_t) di];
-        cudaSetDevice(d.id);
-        cudaStream_t s = d.st;
+        cudaSetDevice(devs[(size_t) di].id);
         const double stream_start = c.stream_bytes;
         if (!c.flow) {
             err = "layer-major on a non-flow prompt path";
             return false;
         }
-        CK(cudaStreamSynchronize(s));
-        CK(cudaStreamSynchronize(c.cs));
-        c.items.clear();
-        c.base = c.n_read = c.n_dma = c.n_comp = 0;
-        c.n_file = 0;
-        std::fill(c.stage_item.begin(), c.stage_item.end(), -1);
-        c.fl_layers.clear();
-        for (int il = 0; il < g.nl; ++il)
-            for (int m = 0; m < L[(size_t) il].nm; ++m)
-                if (member(L[(size_t) il], m).dev == di) c.fl_layers.push_back(il);
-        c.fl_T = run.T;
-        c.fl_yoco = run.yoco;
-        c.fl_cut_k = run.cut_k;
-        c.fl_cut_r = run.cut_r;
-        c.spec_k = c.spec_il = -1;
-        c.wait_ms = 0;
-        c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = 0;
-        c.lc_il = -1;
-        c.lc_used = 0;
-        c.lc_first = c.lc_chk = 0;
-        c.io_d0 = c.io->direct_bytes();
-        c.io_b0 = c.io->buffered_bytes();
-        static const int buf_max = std::getenv("DS4_FLOW_BUFFERED") ? std::atoi(std::getenv("DS4_FLOW_BUFFERED"))
-                                                                    : devs.size() == 1 ? 1024 : 0;
-        int run_n = 0;
-        for (int t : run.T) run_n += t;
-        c.buffered = run_n <= buf_max;
-        if (!c.fl_layers.empty()) {
-            const int il = c.fl_layers[0], k = run.yoco >= 0 && il >= run.yoco ? run.cut_k : 0;
-            flow_spec(c, k, il, fl_rows(c, k, il));
-            if (!flow_pump(c, err)) return false;
-        }
+        if (!flow_begin(di, run, err)) return false;
         return run_dev_layers(di, run, err, stream_start);
     }
 

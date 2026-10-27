@@ -85,7 +85,7 @@ class ServePath(unittest.TestCase):
         m = re.search(r"static bool serve_multi\(int parallel\) \{ return parallel > 1; \}", source)
         self.assertIsNotNone(m, "serve's multi/single choice is not factored")
         for line in ("const bool multi = serve_multi(parallel);", "in.tagged = multi;",
-                     "if (!multi && held.empty())"):
+                     "if (!multi) slot_put(\" as the engine ended\");"):
             self.assertIn(line, source)
         with tempfile.TemporaryDirectory() as d:
             src = Path(d) / "path.cpp"
