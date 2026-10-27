@@ -669,10 +669,42 @@ arrives when all lanes are busy waits its turn, and a lane's conversation is set
 conversations above are - so `MAYA_DS4_SLOT_KEEP` keeps working per lane (and A, B, C, then A's next turn takes A's
 conversation back).
 
+**The serve loop.** With N > 1 the engine's loop is an event queue (`src/ds4/ds4_evt.hpp`, the
+[evt](https://github.com/mrsirg97-rgb/evt) engine of [rig](https://github.com/mrsirg97-rgb/rig), ported): events in
+(priority, id) order - the highest priority first, then the order they came in - run one at a time by the loop's thread,
+which owns every conversation's job. The events are the reader's lines (a request, a STOP), a conversation's token done
+(the head GPU's stream calls back once a window's token is there, `Model::multi_on_done`, so the loop never waits on one
+conversation while another's is ready), and the choice of the next prompt to read - in that order of priority, so every
+request that came is admitted before the next read is chosen. Work that needs every GPU - a prompt's read, the expert
+cache's boundary - asks for them (`want_devices`): the conversations' next tokens wait while their issued ones come back,
+it runs, and they are issued again. Nothing polls.
+
+**Which prompt is read next.** One read at a time (it has every GPU); the next is the **highest response ratio**:
+(its wait + its read) / its read, its read the tokens it has left at the last read's measured rate. Waiting alike, the
+shortest goes first - the least waiting in all - and a long prompt's ratio grows as it waits, so a stream of short ones
+does not starve it. Before each read the conversations answering get a token each (a round, which also measures their
+rate), and then the read waits while the soonest answer would end before the read does (shortest remaining work first,
+the rule the decode gaps below use too) - an answer's length expected from the answers ended so far (its `max_new` at
+most), or as many tokens again as it has once it is past that. `MAYA_DS4_READ_ORDER=arrival` reads them first come,
+first served instead (to compare). Four requests at once on a 3-GPU split (GSQ, 32-token answers), sent longest first:
+
+| Prompt (tokens) | First come, first served: first token / done (s) | Shortest remaining work first: first token / done (s) |
+| ---: | ---: | ---: |
+| 250 | 28.4 / 30.3 | 2.9 / 3.9 |
+| 1,000 | 25.8 / 30.2 | 7.7 / 8.9 |
+| 4,000 | 22.1 / 30.1 | 13.4 / 14.4 |
+| 16,000 | 11.0 / 15.2 | 24.4 / 25.4 |
+| mean | 21.8 / 26.4 | 12.1 / 13.2 |
+
+All four were done after 30.3 s and 25.4 s. The long prompt waits for the short ones, which is the trade: a request is
+answered whole in about the time its own prompt takes to read. With the 16,000-token one sent 1.5 s before the others
+(they arrive while it is read), their first tokens came 13.7 / 18.9 / 24.6 s after the first send, the mean done 19.0 s.
+
+**A request past the N states** waits for a lane (in the order they came), where the engine used to answer it with ERR.
+
 **What is not the same as alone.** A prompt is read in the same pieces the one-conversation path reads it (windows of 16
-where the chunked path is off, chunks where it is on), and a piece of each prompt being read is taken in turn - a new
-request's prompt no longer waits for the whole of another's 100k-token read before it starts. With the decode gaps
-off, the pieces are the same, so a conversation's greedy answer must be the one it gets alone; `tools/ds4/parallel_test.py`
+where the chunked path is off, chunks where it is on) - a new request's prompt no longer waits for the whole of another's
+100k-token read before it starts. With the decode gaps off, the pieces are the same, so a conversation's greedy answer must be the one it gets alone; `tools/ds4/parallel_test.py`
 checks that token for token with 2 and 4 at once with `MAYA_DS4_PREFILL_GAPS=0` (as the GLM engine's docs say for its
 own `--parallel`), and the reading check with them on. It measures the exceptions first:
 a prompt read twice at `--parallel 1` must answer the same both times - where the expert tiers had to fetch from the
@@ -682,15 +714,24 @@ window (`MAYA_DS4_MULTI_BOUNDARY`, 32 windows a conversation): an expert moved o
 meet a conversation that is mid-window - a card may be ahead on one conversation while another's token is still being
 taken, and the slots are shared.
 
-**Decode gaps while a prompt is read.** With `--parallel` above 1 and the chunked prompt path, a prompt read pauses at
-its chunk boundaries (every device held at a boundary, the pipeline and the uncut read's chunks kept, the expert pool's
-tail still lent) so that the running conversations decode while it is read. `MAYA_DS4_PREFILL_GAPS=<percent>[,<max gap
-ms>]` sets the share; with `--parallel` above 1 it is on by default at 50 - the equal-share point of GLM's rule (a gap
-as long as the stage that made the running request wait, so the read takes at most twice the uncut time and a request
-decodes half the read's wall). A gap is percent / (100 - percent) of the stage before it, one decode round at least, at
-most 4000 ms; a gap that overruns ends the gaps of that read with one stderr line. A request that arrives while the read
-is paused is admitted and, if its prompt fits a chunk, read in its own lane in windows (a lane's own buffers, not the
-read's staging); a longer one waits its turn. Text prompts only; `--prefill-chunk 0` (windows) or the layer-major read:
+**Decode gaps while a prompt is read.** With `--parallel` above 1 and the chunked prompt path, a prompt read can pause
+at its chunk boundaries (every device held at a boundary, the pipeline and the uncut read's chunks kept, the expert
+pool's tail still lent) so that the running conversations decode while it is read. By default the gaps are the same rule
+as the choice between reads: at a boundary, the answers decode while the soonest one would end before the rest of the
+read does - a round at least, each round measuring them again, 4000 ms at most - and the read goes on once no answer
+would. A nearly finished answer then gets its end before a long read, and a long answer that has just begun does not
+stretch a short one. `MAYA_DS4_PREFILL_GAPS=<percent>[,<max gap ms>]` takes a fixed share instead (GLM's rule: a gap is
+percent / (100 - percent) of the stage before it, one decode round at least): on the four requests above with a 200-token
+answer for the 250, the adaptive gaps finished them on the mean in 18.6 s, a fixed 50% in 24.9 s. A gap that overruns
+its most ends the gaps of that read with one stderr line. A request that arrives while the read is paused is admitted;
+if its prompt fits a chunk it is read in its own lane in windows (a lane's own buffers, not the read's staging) only
+where that is measured quicker than its turn in chunks after the read - its windows at what a prompt window took here
+(not measured yet: its first window, which measures one), against the rest of the read and its own read at the read's
+rate so far (its progress; before a chunk of it is through, the last read's) - and a prompt waiting that fits a chunk
+asks again at every boundary. Windows read a prompt several times slower than chunks: a 4,000-token prompt took 54 s
+that way in a gap of a 16,000-token read, ~4 s in chunks after it; a 256-token one in a 100,000-token read's gaps
+answered all 16 of its tokens (33 tok/s) before the read was through. The 4000 ms bound is the decode's in a gap, not a
+prompt's read there. Text prompts only; `--prefill-chunk 0` (windows) or the layer-major read:
 no gaps (the load says so for windows; the layer-major path is not chunked); N=1 is untouched. Inside a gap the expert
 cache does not look at its tiers.
 Not bit-exact: a gap's decode can move experts into spare slots, so a later chunk can find other experts resident,
@@ -714,7 +755,9 @@ extra conversation does not add much; where they are not, it does.
 | --- | --- | --- |
 | `MAYA_DS4_SEQ_CTX` | the context | the tokens each conversation's state after the first reaches (`--parallel N`, N > 1): a lane smaller than the first costs that much less of the expert pool, and a request whose prompt and answer are longer than it is refused. The first conversation's state is for the whole context |
 | `MAYA_DS4_MULTI_BOUNDARY` | 32 | the windows a conversation, times the conversations running, between two of the expert cache's looks at its tiers: at a boundary every issued token is taken back and the cache may move an expert, which no conversation is mid-window over. `0`: never (the cache then waits for the next prompt) |
-| `MAYA_DS4_PREFILL_GAPS` | on at 50 with N > 1 | `<percent>[,<max gap ms>]` (1-90; max 4000 ms): at a chunk boundary of a prompt read the running conversations decode for about percent / (100 - percent) of the stage before it, one round at least. `0` or a malformed value: off. `MAYA_DS4_PREFILL_GAP_CREDIT=0`: a gap at every boundary, a round at least each. Needs the chunked prompt path and `--parallel` above 1; N=1 and the layer-major read are unchanged |
+| `MAYA_DS4_PREFILL_GAPS` | unset: adaptive, with N > 1 | unset: at a chunk boundary of a prompt read the running conversations decode while the soonest answer would end before the read does (shortest remaining work first; a round at least, 4000 ms at most). `<percent>[,<max gap ms>]` (1-90; max 4000 ms): a fixed share instead - about percent / (100 - percent) of the stage before it, one round at least (`MAYA_DS4_PREFILL_GAP_CREDIT=0`: a gap at every boundary). `0` or a malformed value: off. Needs the chunked prompt path and `--parallel` above 1; N=1 and the layer-major read are unchanged |
+| `MAYA_DS4_READ_ORDER` | the highest response ratio | `arrival`: the prompts waiting are read first come, first served (as before the event loop; to compare). Otherwise the highest (wait + read) / read next, and a read waits while an answer would end before it |
+| `MAYA_DS4_PREFILL_MIN_CHUNKS` | off | `<n>[,<min tokens>]` (2-8, 512 tokens at least): with the gaps on, a read while other conversations answer is cut into n chunks at least, so a prompt of one chunk has boundaries for gaps. Off by default: a chunk streams every expert its rows route to, about as many for 1,000 rows as for 4,000, so where the experts do not all fit in VRAM a cut read streams them again a chunk (a 3-GPU split, GSQ: a 4,000-token read ~12 s in four chunks, ~4 s in one, at gap shares of 50, 20 and 10% alike). Where every expert is in VRAM a chunk's cost follows its rows. Not bit-exact, as `--prefill N` is not |
 | `--parallel N` | 1 | the conversations at once, 1-8; `1` is the single path as before. With N > 1 the server's `READY` says `multi=N` and every request's lines carry its `rid` |
 
 ## DeepSeek: conversations kept (an agent's parent and workers on one model)

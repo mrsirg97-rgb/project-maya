@@ -27,7 +27,7 @@ Checks (greedy, spec=0 so a conversation's state ends exactly at its last printe
 
 The exactness checks (alone, together, slots, stop) run with MAYA_DS4_PREFILL_GAPS=0: a gap's decode can move experts
 in the pool's lent tail, so a later chunk can find others resident than the uncut read.  The reading and measurement
-runs use gaps at 50 (the default for --parallel above 1).
+runs use the default (adaptive gaps, shortest remaining work first) - a config's own MAYA_DS4_PREFILL_GAPS left out.
 
 `together` is the run that confirms the engine on the hardware: a conversation's window is held in its own slots of the
 mailbox (a layer's device publishes its routing there, the engine's service answers it) and the service takes the
@@ -251,8 +251,7 @@ def main() -> int:
     # reading check needs them on.
     settings_off = dict(settings)
     settings_off["MAYA_DS4_PREFILL_GAPS"] = "0"
-    settings_gaps = dict(settings)
-    settings_gaps["MAYA_DS4_PREFILL_GAPS"] = "50"
+    settings_gaps = {k: v for k, v in settings.items() if k != "MAYA_DS4_PREFILL_GAPS"}
 
     if not os.path.exists(a.exe):
         print(f"{a.exe}: no engine - build it first (cmake --build build --target maya-ds4)", flush=True)

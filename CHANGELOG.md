@@ -11,19 +11,35 @@ only what changed and starts; the model is not downloaded again.
   conversations at the same time - a request no longer waits for the whole of another's long answer. `1` (the default)
   is the single conversation path as before, token for token: `READY` has no `multi=`, no `rid`, and pictures, `STOP`
   and the engine-end slot work as they did. With several, the DSpark drafter does not run and the load's log says so
-  (nor does a helper GPU's lane, which the engine refuses then).
-  `tools/ds4/parallel_test.py` checks and measures it. [docs/SETTINGS.md](docs/SETTINGS.md).
+  (nor does a helper GPU's lane, which the engine refuses then). A request past the N states waits for a lane instead of
+  an ERR. `tools/ds4/parallel_test.py` checks and measures it. [docs/SETTINGS.md](docs/SETTINGS.md).
+- **DeepSeek: several conversations scheduled, shortest remaining work first.** The loop runs on an event queue (rig's
+  evt, ported: `src/ds4/ds4_evt.hpp`) - requests, a token done (a callback on the GPU's stream) and the choice of the
+  next read are events in priority order, and a read or the expert cache's boundary takes the GPUs once every issued
+  token is back. The next prompt read is the highest response ratio ((wait + read) / read: the shortest first, a long one
+  rising as it waits), and a read waits while a running answer would end before it does. Four requests at once on a
+  3-GPU split (16K / 4K / 1K / 250 tokens): the 250-token one answered whole in 3.9 s (30.3 s first come, first served),
+  every one on the mean in 13.2 s (26.4). `MAYA_DS4_READ_ORDER=arrival` reads them in arrival order.
 - **DeepSeek: decode gaps while a prompt is read** (`MAYA_DS4_PREFILL_GAPS`): with `--parallel` above 1 a prompt
-  read pauses at its chunk boundaries so the running conversations keep decoding, and a request that arrives during
-  the read is admitted (a short prompt read in its own lane in windows) instead of waiting for the whole read. The
-  setting is on at 50% (`<percent>[,<max gap ms>]`, 1-90, 4000 ms at most), `0` is off, and N=1 is unchanged. The read
-  takes about twice as long where every expert is in VRAM; not bit-exact, so compare greedy answers with the gaps off.
+  read can pause at its chunk boundaries so the running conversations keep decoding, and a request that arrives during
+  the read is admitted. By default a gap is the same rule as between reads - the answers decode while the soonest one
+  would end before the rest of the read - from measured rates and the answers' lengths so far; `<percent>[,<max gap
+  ms>]` takes a fixed share instead, `0` is off, and N=1 is unchanged. A short prompt that arrives is read in windows in
+  a gap only where that is measured quicker than its turn in chunks (a 4,000-token one took 54 s in windows).
+  `MAYA_DS4_PREFILL_MIN_CHUNKS` (off) cuts a read into chunks so that a short one has gaps too - off because a chunk
+  streams its routed experts again where they do not all fit in VRAM. Not bit-exact, so compare greedy answers with the
+  gaps off.
   `tools/ds4/parallel_test.py` checks the reading and measures the running conversations' rate. [docs/SETTINGS.md](docs/SETTINGS.md).
 - **DeepSeek: a 512-2047-token prompt no longer goes through windows at a sixth of the speed** on a fresh engine. The
   choice between the chunked prompt path and windows of 16 modelled a window from its experts' bytes, which left out
   the fixed costs every window pays on every GPU and the CPU lane's real speed: on a 3-GPU split the second prompt
   after a start went through windows (100 tokens/s, against 600 in chunks). Windows are now picked from what a full
   prompt window really took, every one measured (short prompts' too), and the chunked path until one has run.
+- **DeepSeek: the PCIe lane's pulls numbered per GPU.** The fetch kernel's flags are its GPU's, one set for every
+  conversation, and wait for a value equal to the pull's; with several conversations each numbered its requests from 1,
+  so two on one GPU with the same number found the flags set before the experts were read (NaN rows, then an illegal
+  address a few tokens later). A pull's number is now seq * conversations + conversation - one conversation's seq
+  exactly.
 
 ## v1.1.28 - 2026-10-25
 

@@ -822,6 +822,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::function<void()> admit_waiting, kick_read;
         double read_tok_ms = 0.0;   // the last read's tokens a millisecond (0: none yet) - a waiting read's own time
         double read_t0 = 0.0;       // when the read in progress began (a gap's estimate of what is left of it)
+        int64_t read_done = 0;      // the read in progress's tokens through every layer so far (the model's progress)
         int active = 0, since_boundary = 0, stat_n = 0, counter = 0;
         double stat_t0 = now_ms();
         strata::ds4::Stats stat_s0 = m.stats();
@@ -1047,11 +1048,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             gap_failed = false;
             m.set_prefill_gap_wanted([&] {
                 if (!pg.on() || gaps_over || j.stopping) return false;
-                bool any_answer = false;
-                for (Job& k : jobs)
-                    if (k.used && !k.reading) any_answer = true;
-                if (!any_answer && lines_waiting.load() == 0) return false;
-                if (lines_waiting.load() > 0) return true;
+                // (a prompt waiting that fits a chunk: a gap asks the windows rule again - once the read's rate is
+                //  known it may read it in windows instead of after the read)
+                bool any_answer = false, short_waiting = false;
+                const int ch = m.prompt_chunk();
+                for (Job& k : jobs) {
+                    if (!k.used) continue;
+                    if (!k.reading) any_answer = true;
+                    else if (&k != &j && ch > 0 && k.total - k.done <= (size_t) ch) short_waiting = true;
+                }
+                if (!any_answer && !short_waiting && lines_waiting.load() == 0) return false;
+                if (lines_waiting.load() > 0 || short_waiting) return true;
                 if (gaps_adaptive) return answers_first();
                 if (!gap_credit) return true;
                 return strata::ds4::prefill_gap_due(pg, now_ms() - gap_mark, gap_round_ms);
@@ -1061,6 +1068,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const bool fin = j.done + n == j.total;
             const double t_read = now_ms();
             read_t0 = t_read;
+            read_done = 0;
+            m.set_progress([&](int64_t d) { read_done = d; });
             static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
             if (j.from > 0 && j.from < j.total && j.done == j.from) m.checkpoint(1);   // (a STOP goes back here)
             std::string e;
@@ -1073,6 +1082,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 ok = fin ? m.feed_mark(j.r.ids.data() + j.done, (int) n, 1, 1, e)
                          : m.feed(j.r.ids.data() + j.done, (int) n, 0, e);
             m.set_cancel(nullptr);
+            m.set_progress(nullptr);
             m.set_prefill_gap(std::function<int()>());
             m.set_prefill_gap_wanted(std::function<bool()>());
             reading_job = nullptr;
@@ -1293,29 +1303,37 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     stop_read(j);
                     continue;
                 }
-                const size_t rem = j.total - j.done;
+                size_t rem = j.total - j.done;
                 if (rem == 0) {
                     j.reading = false;
                     first_token(j);
                     continue;
                 }
                 // a longer new prompt waits its turn; so does one whose windows would take longer than its turn: the
-                // paused read's rest and its own read in chunks, at the last read's rate, against its windows at what a
-                // window took here - measured both, or it waits (windows read a prompt several times slower than chunks:
-                // a 4,000-token prompt in a gap of a 16,000-token read, 54 s against ~4 s in chunks after it)
+                // paused read's rest and its own read in chunks at the read's rate (this read's so far - its progress -
+                // or the last one's), against its windows at what a window took here (not measured yet: its first
+                // window, which measures one).  Windows read a prompt several times slower than chunks: a 4,000-token
+                // prompt in a gap of a 16,000-token read, 54 s against ~4 s in chunks after it
                 if (ch <= 0 || rem > (size_t) ch) continue;
-                const double win_s = m.window_s();
-                if (win_s <= 0.0 || read_tok_ms <= 0.0) continue;
+                const double busy_ms = now_ms() - read_t0 - gap_ms;
+                const double rate = read_done > 0 && busy_ms > 0.0 ? (double) read_done / busy_ms : read_tok_ms;
+                if (rate <= 0.0) continue;   // (no chunk of it through yet, no read before: the next gap knows)
+                const size_t piece = reading_job->total - reading_job->done;
+                const double paused_left = piece > (size_t) read_done ? (double) (piece - (size_t) read_done) : 0.0;
+                const double turn_ms = (paused_left + (double) rem) / rate;
                 const int wr = m.window_rows();
-                const double paused_left = std::max(0.0, (double) (reading_job->total - reading_job->done) -
-                                                             read_tok_ms * (now_ms() - read_t0));
-                const double turn_ms = (paused_left + (double) rem) / read_tok_ms;
-                const double win_ms = 1000.0 * win_s * (double) ((rem + (size_t) wr - 1) / (size_t) wr);
-                if (win_ms >= turn_ms) continue;
                 m.seq_bind(j.lane);
                 std::string e;
                 bool ok = true;
-                if (rem > 1) ok = m.feed_windows(j.lane, j.r.ids.data() + j.done, (int) rem - 1, 0, e);
+                if (m.window_s() <= 0.0 && rem > (size_t) wr) {
+                    ok = m.feed_windows(j.lane, j.r.ids.data() + j.done, wr, 0, e);
+                    if (ok) {
+                        j.done += (size_t) wr;
+                        rem -= (size_t) wr;
+                    }
+                }
+                if (ok && 1000.0 * m.window_s() * (double) ((rem + (size_t) wr - 1) / (size_t) wr) >= turn_ms) continue;
+                if (ok && rem > 1) ok = m.feed_windows(j.lane, j.r.ids.data() + j.done, (int) rem - 1, 0, e);
                 if (ok) m.checkpoint(1);
                 if (ok) ok = m.feed_windows(j.lane, j.r.ids.data() + j.done + (long) rem - 1, 1, 1, e);
                 if (!ok) {
@@ -1344,6 +1362,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             m.seq_bind(reading_job->lane);
             if (gap_failed) return 2;
+            // (the overrun bound is the decode's - a prompt read here in windows is its own, measured cheaper than its
+            //  turn - while the read's paused time, gap_ms, is all of it)
+            const double t_decode = now_ms();
             bool any = false;
             for (Job& j : jobs)
                 if (j.used && !j.reading) any = true;
@@ -1351,10 +1372,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 const double this_ms = now_ms() - t_in;
                 gap_ms += this_ms;
                 gap_mark = now_ms();
-                if (this_ms > pg.max_ms && !gaps_over) {
+                if (now_ms() - t_decode > pg.max_ms && !gaps_over) {
                     gaps_over = true;
                     std::fprintf(stderr, "ds4 multi: a decode gap took %.0f ms (more than %.0f): no more gaps in this read\n",
-                                 this_ms, pg.max_ms);
+                                 now_ms() - t_decode, pg.max_ms);
                 }
                 return 0;
             }
@@ -1378,7 +1399,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             //  measures them again - up to the longest gap)
             const auto go_on = [&] {
                 if (!round_done()) return true;
-                if (gaps_adaptive) return answers_first() && now_ms() - t_in < pg.max_ms;
+                if (gaps_adaptive) return answers_first() && now_ms() - t_decode < pg.max_ms;
                 return now_ms() - t_in < budget;
             };
             while (!gap_failed && !quit && in_flight > 0 && go_on()) {
@@ -1401,10 +1422,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (round_ms > 0.0) gap_round_ms = round_ms;
             gap_mark = now_ms();
             ++gap_count;
-            if (this_ms > pg.max_ms && !gaps_over) {
+            if (now_ms() - t_decode > pg.max_ms && !gaps_over) {
                 gaps_over = true;
                 std::fprintf(stderr, "ds4 multi: a decode gap took %.0f ms (more than %.0f): no more gaps in this read\n",
-                             this_ms, pg.max_ms);
+                             now_ms() - t_decode, pg.max_ms);
             }
             return 0;
         };
