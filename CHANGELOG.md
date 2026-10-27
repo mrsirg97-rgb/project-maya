@@ -44,6 +44,14 @@ only what changed and starts; the model is not downloaded again.
   address a few tokens later). A pull's number is now seq * conversations + conversation - one conversation's seq
   exactly.
 
+## v1.1.33 - 2026-10-27
+
+A quick fix for setting up MiniMax-M3.1-Flash from our GGUFs.
+
+- **Fix: a new MiniMax GGUF setup finishes again** (#555, @GoKu-Gear6): the setup's pack step now finds the
+  `-maya-indexers.bin` file beside the shards. Since v1.1.31 it stopped with "the sparse-attention indexer of layers
+  0, 1, 2 is not in the set". A MiniMax already set up was not affected.
+
 ## v1.1.32 - 2026-10-27
 
 A quick fix for the new web UI.
