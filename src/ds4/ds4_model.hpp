@@ -151,6 +151,9 @@ public:
     /// The token multi_issue sent for conversation `s`, waited for (its window through every layer done).  A token < 0
     /// and err: the window failed (a kernel's error), and the conversation's state is not to be trusted past it.
     int multi_take(int s, std::string& err);
+    /// Called with s once conversation s's issued token is ready (multi_take returns it at once): on a CUDA thread,
+    /// after the window's last work on the head's stream, so it only posts - it must not call the model.  Null: none.
+    void multi_on_done(std::function<void(int)> f);
     /// The boundary between rounds of several conversations (GLM's multi_boundary): every device's stream finished, then
     /// the expert cache's look at the tiers - between windows, where nothing in flight is moved out from under it.  The
     /// engine calls it once every STRATA_DS4_MULTI_BOUNDARY windows (32, times the conversations running) of an

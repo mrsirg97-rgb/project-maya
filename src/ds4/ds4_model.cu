@@ -979,6 +979,11 @@ struct Model::Impl {
     // `prefill_gap_wanted` says whether this boundary is due; `prefill_gap` runs the gap (0 go on, 1 the read
     // stopped, 2 failed).  `in_gap` skips the expert cache's tier look inside it.
     PrefillGaps gaps;
+    // MAYA_DS4_PREFILL_MIN_CHUNKS=<n>[,<min tokens>] (with the gaps on: 4,512; 0: off): a read while other conversations
+    // answer is cut into n chunks at least, none shorter than <min tokens> - a prompt of one chunk has no boundary for
+    // a gap, so the answers waited for all of it (2,000 tokens: ~4 s a read, the four of a measurement one after the
+    // other).  Not bit-exact, as --prefill N is not: the chunk's length changes the prompt's arithmetic
+    int min_chunks = 0, min_chunk_rows = 0;
     std::function<bool()> prefill_gap_wanted;
     std::function<int()> prefill_gap;
     bool in_gap = false;
@@ -1194,6 +1199,13 @@ struct Model::Impl {
     };
     static constexpr int kParallelMax = 8;   // the conversations at once (--parallel's range: a lane's state and hand-offs each)
     std::vector<Lane> lanes;           // (empty: one conversation, the model's own: the engine as before)
+    // multi_on_done: the head stream's host callback after a lane's token (its argument: the lane's entry here)
+    std::function<void(int)> on_done;
+    std::vector<std::pair<Impl*, int>> done_arg;
+    static void CUDART_CB lane_done(void* v) {
+        const auto* a = (const std::pair<Impl*, int>*) v;
+        if (a->first->on_done) a->first->on_done(a->second);
+    }
     int cur_seq = 0;                   // the lane bound
     int64_t lane_ctx = 0;              // the tokens lanes 1 .. hold (STRATA_DS4_SEQ_CTX; seq_context)
     uint16_t* h_emb_l = nullptr;       // pinned [lane][kWin][dim] BF16: each lane's window's embedding rows
@@ -2718,6 +2730,16 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4 multi: prompts run in windows of %d tokens: no decode gaps "
                                  "(MAYA_DS4_PREFILL_GAPS needs the chunked prompt path)\n", kWin);
             gaps.percent = 0;
+        }
+        if (gaps.percent > 0) {
+            min_chunks = 4;
+            min_chunk_rows = 512;
+            if (const char* cv = std::getenv("MAYA_DS4_PREFILL_MIN_CHUNKS")) {
+                int cn = 0, cr = 0;
+                const int got = std::sscanf(cv, "%d,%d", &cn, &cr);
+                min_chunks = got >= 1 && cn > 1 ? std::min(cn, 8) : 0;
+                if (got >= 2 && cr > 0) min_chunk_rows = std::max(cr, 256);
+            }
         }
         if (gaps.percent > 0)
             std::fprintf(stderr, "ds4 multi: decode gaps at the prompt read's chunk boundaries: %d%% (a gap "
@@ -12719,9 +12741,14 @@ struct Model::Impl {
         const bool cut_rows = a > 0 && (yoco_one_gpu() || yoco_suffix_gpu(yl));
         Run run;
         int per = 0;   // (the widest chunk)
+        // (MAYA_DS4_PREFILL_MIN_CHUNKS: while other conversations answer - the loop wants a gap at the read's start -
+        //  min_chunks chunks at least, of min_chunk_rows rows at least)
+        const bool cut = min_chunks > 1 && gaps.percent > 0 && prefill_gap && prefill_gap_wanted && prefill_gap_wanted();
         auto part = [&](int a0, int a1) {   // rows [a0, a1) in equal chunks of at most `chunk`
             if (a1 <= a0) return;
-            const int nc = (a1 - a0 + chunk - 1) / chunk, w = (a1 - a0 + nc - 1) / nc;
+            int nc = (a1 - a0 + chunk - 1) / chunk;
+            if (cut) nc = std::max(nc, std::min(min_chunks, (a1 - a0) / min_chunk_rows));
+            const int w = (a1 - a0 + nc - 1) / nc;
             for (int x = a0; x < a1; x += w) {
                 run.p0.push_back(pos + x);
                 run.T.push_back(std::min(w, a1 - x));
@@ -13333,6 +13360,7 @@ struct Model::Impl {
                                        d.tok, d.st);
         CK(cudaMemcpyAsync(ln.tok_h, d.tok, sizeof(int), cudaMemcpyDeviceToHost, d.st));
         CK(cudaEventRecord(ln.done, d.st));
+        if (on_done && (size_t) lane < done_arg.size()) CK(cudaLaunchHostFunc(d.st, lane_done, &done_arg[(size_t) lane]));
         return true;
     }
 
@@ -14199,6 +14227,16 @@ bool Model::multi_issue(int s, int token, float t, float tp, int tk, float mp, u
     return p_->multi_issue(s, token, t, tp, tk, mp, seed, counter, err);
 }
 int Model::multi_take(int s, std::string& err) { return p_->multi_take(s, err); }
+void Model::multi_on_done(std::function<void(int)> f) {
+    Impl& p = *p_;
+    if (!f && !p.devs.empty()) {   // (a callback still queued on the head's stream runs before the old one goes)
+        cudaSetDevice(p.devs[(size_t) p.head_dev].id);
+        cudaStreamSynchronize(p.devs[(size_t) p.head_dev].st);
+    }
+    p.done_arg.clear();
+    for (int s = 0; s < (int) p.lanes.size(); ++s) p.done_arg.emplace_back(&p, s);
+    p.on_done = std::move(f);
+}
 bool Model::multi_boundary(int tokens, std::string& err) { return p_->multi_boundary(tokens, err); }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::save_profile() const { p_->save_profile(); }
