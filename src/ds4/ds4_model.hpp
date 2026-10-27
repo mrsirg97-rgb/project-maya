@@ -120,6 +120,11 @@ public:
     bool feed_windows(int lane, const int* tokens, int n, int logits_rows, std::string& err);
     /// The chunked prompt path's chunk (0: windows), for the multi loop's short-prompt read in a gap.
     int prompt_chunk() const;
+    /// A prompt window's tokens, and what a full one took here on average (s; 0: none ran yet) - what reading a prompt
+    /// in windows costs, measured (the multi loop's gap reads a short new prompt in windows only when that is quicker
+    /// than its turn in chunks).
+    int window_rows() const;
+    double window_s() const;
     /// The decode gaps of a prompt read (MAYA_DS4_PREFILL_GAPS), and the gap the serve loop runs at a boundary:
     /// `wanted` says whether this boundary is due, `gap` runs it (0 go on, 1 the read was stopped, 2 failed).
     PrefillGaps prefill_gaps() const;

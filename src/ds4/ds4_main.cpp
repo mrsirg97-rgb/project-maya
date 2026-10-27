@@ -817,8 +817,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }, 200);
         std::atomic<int> lines_waiting{0};   // (the reader's lines not run yet: a read's gap admits them)
         std::deque<Req> waiting;             // requests past the N states: each takes the next lane that frees
+        long long answers_n = 0, answers_tok = 0;   // the answers ended so far and their tokens (an answer's expected length)
+        double decode_round_ms = 0.0;               // a gap's round as last measured: a token for every answer running
         std::function<void()> admit_waiting, kick_read;
         double read_tok_ms = 0.0;   // the last read's tokens a millisecond (0: none yet) - a waiting read's own time
+        double read_t0 = 0.0;       // when the read in progress began (a gap's estimate of what is left of it)
         int active = 0, since_boundary = 0, stat_n = 0, counter = 0;
         double stat_t0 = now_ms();
         strata::ds4::Stats stat_s0 = m.stats();
@@ -884,6 +887,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             j.used = false;
             age[(size_t) j.lane] = ++clock;
             if (active > 0) --active;
+            if (j.produced > 0) {
+                ++answers_n;
+                answers_tok += j.produced;
+            }
             write_done(j);
             if (!waiting.empty()) eng.add([&] { admit_waiting(); }, kLine);
         };
@@ -993,6 +1000,40 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             j.t1 = now_ms();
             end_job(j);
         };
+        // the gaps' rule (MAYA_DS4_PREFILL_GAPS unset): shortest remaining work first, between the read and the answers
+        // running, as between the reads.  An answer's remaining tokens: the answers ended so far average (its max_new at
+        // most; none ended yet: its max_new), or as many again as it has once it is past that - at a round's measured
+        // time each; the read's: the tokens it has left at the last read's rate.  A gap while the soonest answer ends
+        // before the read does.  Not measured yet (no round, no read): a gap - its round measures one
+        const bool gaps_adaptive = std::getenv("MAYA_DS4_PREFILL_GAPS") == nullptr &&
+                                   std::getenv("STRATA_DS4_PREFILL_GAPS") == nullptr;
+        auto answer_left = [&](const Job& j) -> double {
+            const long long cap = j.limit - j.produced;
+            long long left = cap;
+            if (answers_n > 0) {
+                const long long mean = answers_tok / answers_n;
+                left = mean > j.produced ? mean - j.produced : j.produced;
+            }
+            return (double) std::max(1LL, std::min(cap, left));
+        };
+        auto soonest_answer_ms = [&]() -> double {   // (< 0: no answer running)
+            double soonest = -1.0;
+            for (const Job& k : jobs)
+                if (k.used && !k.reading) {
+                    const double t = answer_left(k) * decode_round_ms;
+                    if (soonest < 0.0 || t < soonest) soonest = t;
+                }
+            return soonest;
+        };
+        auto answers_first = [&]() -> bool {
+            if (reading_job == nullptr) return false;
+            if (decode_round_ms <= 0.0 || read_tok_ms <= 0.0) return true;
+            const double soonest = soonest_answer_ms();
+            if (soonest < 0.0) return false;
+            const double read = std::max(0.0, (double) (reading_job->total - reading_job->done) -
+                                                  read_tok_ms * (now_ms() - read_t0 - gap_ms));
+            return soonest < read / read_tok_ms;
+        };
         // its prompt's next piece: feed_unit() tokens, as the one-conversation path's loop feeds them; PP <rid> read
         // total ms tok/s reuse.  False: it ended there (a STOP, or an error)
         auto read_piece = [&](Job& j) -> bool {
@@ -1010,13 +1051,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 for (Job& k : jobs)
                     if (k.used && !k.reading) any_answer = true;
                 if (!any_answer && lines_waiting.load() == 0) return false;
-                if (!gap_credit || lines_waiting.load() > 0) return true;
+                if (lines_waiting.load() > 0) return true;
+                if (gaps_adaptive) return answers_first();
+                if (!gap_credit) return true;
                 return strata::ds4::prefill_gap_due(pg, now_ms() - gap_mark, gap_round_ms);
             });
             m.set_prefill_gap([&] { return read_gap(); });
             const size_t n = std::min<size_t>((size_t) m.feed_unit(), j.total - j.done);
             const bool fin = j.done + n == j.total;
             const double t_read = now_ms();
+            read_t0 = t_read;
             static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
             if (j.from > 0 && j.from < j.total && j.done == j.from) m.checkpoint(1);   // (a STOP goes back here)
             std::string e;
@@ -1032,7 +1076,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             m.set_prefill_gap(std::function<int()>());
             m.set_prefill_gap_wanted(std::function<bool()>());
             reading_job = nullptr;
-            if (ok && n > 0) read_tok_ms = (double) n / std::max(1.0, now_ms() - t_read);
+            if (ok && n > 0) read_tok_ms = (double) n / std::max(1.0, now_ms() - t_read - gap_ms);   // (its gaps out)
             j.done += n;
             {
                 const double ms = now_ms() - j.t0;
@@ -1255,9 +1299,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     first_token(j);
                     continue;
                 }
-                // a longer new prompt waits its turn; so does one the paused read is no longer than a chunk of (its turn
-                // comes within that chunk's time, and windows read a prompt several times slower than chunks do)
-                if (ch <= 0 || rem > (size_t) ch || reading_job->total - reading_job->done <= (size_t) ch) continue;
+                // a longer new prompt waits its turn; so does one whose windows would take longer than its turn: the
+                // paused read's rest and its own read in chunks, at the last read's rate, against its windows at what a
+                // window took here - measured both, or it waits (windows read a prompt several times slower than chunks:
+                // a 4,000-token prompt in a gap of a 16,000-token read, 54 s against ~4 s in chunks after it)
+                if (ch <= 0 || rem > (size_t) ch) continue;
+                const double win_s = m.window_s();
+                if (win_s <= 0.0 || read_tok_ms <= 0.0) continue;
+                const int wr = m.window_rows();
+                const double paused_left = std::max(0.0, (double) (reading_job->total - reading_job->done) -
+                                                             read_tok_ms * (now_ms() - read_t0));
+                const double turn_ms = (paused_left + (double) rem) / read_tok_ms;
+                const double win_ms = 1000.0 * win_s * (double) ((rem + (size_t) wr - 1) / (size_t) wr);
+                if (win_ms >= turn_ms) continue;
                 m.seq_bind(j.lane);
                 std::string e;
                 bool ok = true;
@@ -1320,9 +1374,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             issuing = true;
             reissue();
             double round_ms = 0.0;
-            while (!gap_failed && !quit && in_flight > 0 && (now_ms() - t_in < budget || !round_done())) {
+            // (adaptive: a round at least, then on while the soonest answer still ends before the read - each round
+            //  measures them again - up to the longest gap)
+            const auto go_on = [&] {
+                if (!round_done()) return true;
+                if (gaps_adaptive) return answers_first() && now_ms() - t_in < pg.max_ms;
+                return now_ms() - t_in < budget;
+            };
+            while (!gap_failed && !quit && in_flight > 0 && go_on()) {
                 if (!eng.pump(-1)) break;
-                if (round_ms <= 0.0 && round_done()) round_ms = now_ms() - t_rounds;
+                if (round_ms <= 0.0 && round_done()) {
+                    round_ms = now_ms() - t_rounds;
+                    decode_round_ms = round_ms;
+                }
             }
             issuing = false;
             while (in_flight > 0 && eng.pump(-1)) {}
@@ -1344,44 +1408,61 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             return 0;
         };
-        // the prompts being read, each when every issued token is back, the shortest first (the fewest tokens left to
-        // read, then the earliest) - the least waiting in all - except one that has waited longer than its own read takes
-        // at the last read's rate: those first, the earliest of them (nobody waits much more than twice its own read).
+        // the prompts being read, each when every issued token is back, the highest response ratio next: (its wait + its
+        // read) / its read, its read the tokens it has left at the last read's rate - the shortest first while they wait
+        // alike, and a long one's ratio grows as it waits, so a stream of short ones does not starve it (no rate yet:
+        // the fewest tokens left; ties the earliest).
         // MAYA_DS4_READ_ORDER=arrival: the earliest first instead (as before the events; to compare).  The answers
-        // running get a round - a token each - before each read, as a gap gives them inside one
+        // running get a round - a token each - before each read (it measures a round); then, the gaps adaptive, the
+        // next read waits while the soonest answer ends before it would (shortest remaining work first, as in a gap)
         bool read_wanted = false;
-        int round_left = 0;   // (tokens the answers are owed before the next read; 0: none owed)
+        int round_left = 0;       // (tokens the answers are owed before the next read; 0: none owed)
+        double round_t0 = 0.0;    // (when that round began)
         auto any_reading = [&]() {
             for (Job& j : jobs)
                 if (j.used && j.reading) return true;
             return false;
         };
+        auto pick_read = [&]() -> int {   // the next read's lane (-1: none)
+            static const bool by_arrival = [] {
+                const char* v = std::getenv("MAYA_DS4_READ_ORDER");
+                return v != nullptr && std::strcmp(v, "arrival") == 0;
+            }();
+            const double now = now_ms();
+            const auto ratio = [&](const Job& j) {   // (no rate yet: the fewest tokens left, as a ratio)
+                const double left = (double) std::max<size_t>(1, j.total - j.done);
+                if (read_tok_ms <= 0.0) return 1.0 / left;
+                const double read = left / read_tok_ms;
+                return (now - j.t0 + read) / read;
+            };
+            int reading = -1;
+            for (const Job& j : jobs) {
+                if (!j.used || !j.reading) continue;
+                if (reading < 0) {
+                    reading = j.lane;
+                    continue;
+                }
+                const Job& b = jobs[(size_t) reading];
+                const double jr = ratio(j), br = ratio(b);
+                const bool better = by_arrival ? j.t0 < b.t0 : jr != br ? jr > br : j.t0 < b.t0;
+                if (better) reading = j.lane;
+            }
+            return reading;
+        };
+        auto answers_before_read = [&]() -> bool {   // the soonest answer ends before the next read would
+            if (!gaps_adaptive || decode_round_ms <= 0.0 || read_tok_ms <= 0.0) return false;
+            const int next = pick_read();
+            const double soonest = soonest_answer_ms();
+            if (next < 0 || soonest < 0.0) return false;
+            const Job& n = jobs[(size_t) next];
+            return soonest < (double) (n.total - n.done) / read_tok_ms;
+        };
         auto schedule_read = [&]() {
-            if (read_wanted || quit || round_left > 0 || !any_reading()) return;
+            if (read_wanted || quit || round_left > 0 || !any_reading() || answers_before_read()) return;
             read_wanted = true;
             want_devices([&] {
                 read_wanted = false;
-                static const bool by_arrival = [] {
-                    const char* v = std::getenv("MAYA_DS4_READ_ORDER");
-                    return v != nullptr && std::strcmp(v, "arrival") == 0;
-                }();
-                const double now = now_ms();
-                const auto aged = [&](const Job& j) {
-                    return read_tok_ms > 0.0 && now - j.t0 > (double) (j.total - j.done) / read_tok_ms;
-                };
-                int reading = -1;
-                for (const Job& j : jobs) {
-                    if (!j.used || !j.reading) continue;
-                    if (reading < 0) {
-                        reading = j.lane;
-                        continue;
-                    }
-                    const Job& b = jobs[(size_t) reading];
-                    const bool ja = aged(j), ba = aged(b);
-                    const size_t jl = j.total - j.done, bl = b.total - b.done;
-                    const bool better = by_arrival ? j.t0 < b.t0 : ja != ba ? ja : ja || jl == bl ? j.t0 < b.t0 : jl < bl;
-                    if (better) reading = j.lane;
-                }
+                const int reading = pick_read();
                 if (reading < 0) return;
                 Job& j = jobs[(size_t) reading];
                 m.seq_bind(j.lane);
@@ -1420,6 +1501,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (j.used && !j.reading) ++answering;
             reissue();
             round_left = in_flight > 0 ? answering : 0;
+            round_t0 = now_ms();
             schedule_read();
         };
         // a token back: taken (printed, its request ended or its next issued), then what waited for it
@@ -1427,7 +1509,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             Job& j = jobs[(size_t) lane];
             if (!j.flying) return;
             take_lane(j);
-            if (round_left > 0 && --round_left == 0) schedule_read();
+            if (round_left > 0 && --round_left == 0) decode_round_ms = now_ms() - round_t0;
+            if (round_left == 0 && !read_wanted) schedule_read();   // (each token: the read's turn may have come)
             // GLM's boundary: every 32 windows a conversation every issued token back, then the expert cache's tiers
             if (boundary_every > 0 && since_boundary >= boundary_every * std::max(1, active)) {
                 since_boundary = 0;

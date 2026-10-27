@@ -979,10 +979,12 @@ struct Model::Impl {
     // `prefill_gap_wanted` says whether this boundary is due; `prefill_gap` runs the gap (0 go on, 1 the read
     // stopped, 2 failed).  `in_gap` skips the expert cache's tier look inside it.
     PrefillGaps gaps;
-    // MAYA_DS4_PREFILL_MIN_CHUNKS=<n>[,<min tokens>] (with the gaps on: 4,512; 0: off): a read while other conversations
-    // answer is cut into n chunks at least, none shorter than <min tokens> - a prompt of one chunk has no boundary for
-    // a gap, so the answers waited for all of it (2,000 tokens: ~4 s a read, the four of a measurement one after the
-    // other).  Not bit-exact, as --prefill N is not: the chunk's length changes the prompt's arithmetic
+    // MAYA_DS4_PREFILL_MIN_CHUNKS=<n>[,<min tokens>] (off by default; with the gaps on): a read while other conversations
+    // answer is cut into n chunks at least, none shorter than <min tokens> (512) - a prompt of one chunk has no boundary
+    // for a gap.  Off: a chunk streams every expert its rows route to, about as many for 1,000 rows as for 4,000, so on
+    // a split whose experts do not all fit in VRAM a cut read streams them again a chunk (a 3-GPU split, GSQ: a 4,000-
+    // token read ~12 s in four chunks, ~4 s in one; at gap shares of 50, 20 and 10% alike).  Where every expert is in
+    // VRAM a chunk's cost follows its rows and the cut is nearly free.  Not bit-exact, as --prefill N is not
     int min_chunks = 0, min_chunk_rows = 0;
     std::function<bool()> prefill_gap_wanted;
     std::function<int()> prefill_gap;
@@ -2732,7 +2734,6 @@ struct Model::Impl {
             gaps.percent = 0;
         }
         if (gaps.percent > 0) {
-            min_chunks = 4;
             min_chunk_rows = 512;
             if (const char* cv = std::getenv("MAYA_DS4_PREFILL_MIN_CHUNKS")) {
                 int cn = 0, cr = 0;
@@ -14169,6 +14170,8 @@ bool Model::feed_windows(int lane, const int* tokens, int n, int logits_rows, st
     return p.feed_windows(lane, tokens, n, logits_rows, err);
 }
 int Model::prompt_chunk() const { return p_->chunk; }
+int Model::window_rows() const { return kWin; }
+double Model::window_s() const { return p_->pm.win_n > 0 ? p_->pm.win_s : 0.0; }
 PrefillGaps Model::prefill_gaps() const { return p_->gaps; }
 void Model::set_prefill_gap(std::function<int()> f) { p_->prefill_gap = std::move(f); }
 void Model::set_prefill_gap_wanted(std::function<bool()> f) { p_->prefill_gap_wanted = std::move(f); }
