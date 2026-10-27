@@ -701,6 +701,7 @@ answered whole in about the time its own prompt takes to read. With the 16,000-t
 (they arrive while it is read), their first tokens came 13.7 / 18.9 / 24.6 s after the first send, the mean done 19.0 s.
 
 **A request past the N states** waits for a lane (in the order they came), where the engine used to answer it with ERR.
+How each rule was chosen, what was tried and did not work, and the tables' script: [DS4_SCHEDULING.md](DS4_SCHEDULING.md).
 
 **What is not the same as alone.** A prompt is read in the same pieces the one-conversation path reads it (windows of 16
 where the chunked path is off, chunks where it is on) - a new request's prompt no longer waits for the whole of another's

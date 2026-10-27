@@ -796,6 +796,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             int last = -1;            // the token taken from its window, not yet its window's input (a drain)
             uint64_t cnt = 0;         // its sample chain's counter (one a request, as the one-conversation path's)
             strata::ds4::Stats s0;
+            // the drafter (its spec, else the engine's): its answer in rounds - drafts verified in one window - each round
+            // the GPUs' alone (an owner, want_devices), in turn with the reads and the other drafting conversations
+            bool drafts = false;
+            bool round_due = false;    // a round is owed it (its next token not out yet)
+            bool round_asked = false;  // (the event that asks the GPUs for it is queued)
+            bool cool = false;         // its last round's drafts were all under the floor: the next does without
+            long long d_off = 0, d_acc = 0;
         };
         const int places = m.seq_count();
         std::vector<Job> jobs((size_t) places);
@@ -821,6 +828,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         double decode_round_ms = 0.0;               // a gap's round as last measured: a token for every answer running
         std::function<void()> admit_waiting, kick_read;
         double read_tok_ms = 0.0;   // the last read's tokens a millisecond (0: none yet) - a waiting read's own time
+        // MAYA_DS4_READ_ORDER: unset the highest response ratio; `arrival` first come, first served; `pieces` round
+        // robin in pieces of a chunk a pipeline stage (the split's stages kept busy, no read's size guessed)
+        const std::string read_order = [] {
+            const char* v = std::getenv("MAYA_DS4_READ_ORDER");
+            return std::string(v != nullptr ? v : "");
+        }();
+        const bool read_pieces = read_order == "pieces";
+        const size_t read_piece_tokens = m.prompt_chunk() > 0
+                                             ? (size_t) m.prompt_chunk() * (size_t) m.pipeline_stages()
+                                             : (size_t) m.feed_unit();
+        std::deque<int> read_fifo;  // (pieces: the conversations reading, in turn - a piece each, then to the back)
         double read_t0 = 0.0;       // when the read in progress began (a gap's estimate of what is left of it)
         int64_t read_done = 0;      // the read in progress's tokens through every layer so far (the model's progress)
         int active = 0, since_boundary = 0, stat_n = 0, counter = 0;
@@ -867,7 +885,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const double t2 = now_ms();
             const strata::ds4::Stats& se = m.stats();
             std::printf("DONE %d %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", j.rid, j.produced, j.r.ids.size(),
-                        j.t1 - j.t0, t2 - j.t1, j.finish.c_str(), 0LL, 0LL, j.from,
+                        j.t1 - j.t0, t2 - j.t1, j.finish.c_str(), j.d_acc, j.d_off, j.from,
                         (long long) ((se.experts - j.s0.experts) - (se.cpu_experts - j.s0.cpu_experts)),
                         (long long) (se.experts - j.s0.experts));
             std::fflush(stdout);
@@ -884,7 +902,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // until another request takes the lane - a waiting one, next)
         auto end_job = [&](Job& j) {
             if (j.flying) --in_flight;
-            j.flying = j.deferred = j.reading = j.stopping = false;
+            j.flying = j.deferred = j.reading = j.stopping = j.round_due = false;
             j.used = false;
             age[(size_t) j.lane] = ++clock;
             if (active > 0) --active;
@@ -916,7 +934,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             j.flying = true;
             ++in_flight;
         };
-        // a token of its answer: printed, then its eos / length / STOP ends it, or the window that reads on is issued
+        // a token of its answer: printed, then its eos / length / STOP ends it (false), or it reads on (true)
+        auto deliver = [&](Job& j, int tok) -> bool {
+            ++j.produced;
+            m.seq_bind(j.lane);   // (its own position: the context's limit below is its lane's)
+            if (j.in_think && tok == j.r.think_end) j.in_think = false;   // (closed: by the model, or by the budget)
+            std::printf("T %d %d\n", j.rid, tok);
+            std::fflush(stdout);
+            bool end = false;
+            for (int e : eos) end = end || tok == e;
+            if (j.stopping) j.finish = "cancel";
+            else if (end) j.finish = "stop";
+            else if (j.produced >= j.limit || m.pos() >= m.seq_context(j.lane)) j.finish = "length";
+            else return true;
+            end_job(j);
+            return false;
+        };
+        // a token of its answer back from its window: delivered, then the window that reads on issued
         auto take_lane = [&](Job& j) {
             const int tok = m.multi_take(j.lane, err);
             if (j.flying) --in_flight;
@@ -934,29 +968,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 end_job(j);
                 return;
             }
-            ++j.produced;
-            m.seq_bind(j.lane);   // (its own position: the context's limit below is its lane's)
-            if (j.in_think && tok == j.r.think_end) j.in_think = false;   // (closed: by the model, or by the budget)
-            std::printf("T %d %d\n", j.rid, tok);
-            std::fflush(stdout);
-            bool end = false;
-            for (int e : eos) end = end || tok == e;
-            bool ended = false;
-            if (j.stopping) {
-                j.finish = "cancel";
-                ended = true;
-            } else if (end) {
-                j.finish = "stop";
-                ended = true;
-            } else if (j.produced >= j.limit || m.pos() >= m.seq_context(j.lane)) {
-                j.finish = "length";
-                ended = true;
-            }
-            if (ended) {
-                end_job(j);
-                return;
-            }
-            issue(j, tok);   // (the token just made is the next window's input)
+            if (deliver(j, tok)) issue(j, tok);   // (the token just made is the next window's input)
         };
         // every issued token back (a prompt piece, a boundary): the prompt path, or the expert cache's look at its
         // tiers, has the devices.  Their next windows are issued by reissue() after it (not before: nothing of the
@@ -1064,7 +1076,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 return strata::ds4::prefill_gap_due(pg, now_ms() - gap_mark, gap_round_ms);
             });
             m.set_prefill_gap([&] { return read_gap(); });
-            const size_t n = std::min<size_t>((size_t) m.feed_unit(), j.total - j.done);
+            const size_t n = std::min<size_t>(read_pieces ? read_piece_tokens : (size_t) m.feed_unit(), j.total - j.done);
             const bool fin = j.done + n == j.total;
             const double t_read = now_ms();
             read_t0 = t_read;
@@ -1111,6 +1123,68 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             return true;
         };
+        // one round of a drafting conversation's answer, the GPUs its own (an owner, or a read's gap): the one-
+        // conversation path's round on its lane - the drafter's drafts while their confidence holds, verified in one
+        // window, else a plain step - and the thinking budget as there (a round never runs past it; the round at it is a
+        // plain step whose next token becomes think_end).  Its tokens delivered; going on, the next round is owed
+        std::function<void(int)> ask_round;
+        auto draft_round = [&](Job& j) {
+            j.round_due = false;
+            if (!j.used || j.reading) return;
+            m.seq_bind(j.lane);
+            if (j.stopping) {
+                j.finish = "cancel";
+                end_job(j);
+                return;
+            }
+            int room = (int) std::min<long long>(j.limit - j.produced, m.seq_context(j.lane) - m.pos());
+            const bool close_think = j.in_think && j.produced >= j.r.think_budget;
+            if (close_think) room = 1;
+            else if (j.in_think) room = (int) std::min<long long>(room, j.r.think_budget - j.produced);
+            const bool try_spec = !j.cool;
+            std::vector<int> got;
+            int off = 0, acc = 0;
+            unsigned long long counter = j.cnt;
+            if (!round(m, j.last, room, try_spec, j.r.conf >= 0 ? j.r.conf : conf_min, j.r.temperature, j.r.top_p,
+                       j.r.top_k, j.r.min_p, j.r.seed, counter, got, off, acc, err, j.r.cum)) {
+                std::fprintf(stderr, "ds4: [%d] %s\n", j.rid, err.c_str());
+                std::printf("ERR %d %s\n", j.rid, err.c_str());
+                std::fflush(stdout);
+                j.finish = "cancel";
+                end_job(j);
+                return;
+            }
+            j.cnt = counter;
+            j.d_off += off;
+            j.d_acc += acc;
+            j.cool = try_spec && off == 0;
+            if (close_think && !got.empty()) got.back() = j.r.think_end;   // (room 1: one token, not fed yet)
+            if (got.empty()) {   // (no room left: as a length end)
+                j.finish = "length";
+                end_job(j);
+                return;
+            }
+            stat_n += (int) got.size();
+            for (int tok : got)
+                if (!deliver(j, tok)) return;
+            j.last = got.back();
+            ask_round(j.lane);
+        };
+        ask_round = [&](int lane) {
+            Job& j = jobs[(size_t) lane];
+            j.round_due = true;
+            if (j.round_asked) return;
+            j.round_asked = true;
+            eng.add([&, lane] {
+                Job& k = jobs[(size_t) lane];
+                k.round_asked = false;
+                if (!k.round_due) return;
+                want_devices([&, lane] {
+                    Job& w = jobs[(size_t) lane];
+                    if (w.round_due) draft_round(w);
+                });
+            }, kToken);
+        };
         // its first token: the prompt's last logits with its chain (greedy or sampled, as a round's)
         auto first_token = [&](Job& j) {
             m.seq_bind(j.lane);
@@ -1138,6 +1212,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             if (ended) {
                 end_job(j);
+                return;
+            }
+            if (j.drafts) {
+                j.last = tok;
+                ask_round(j.lane);
                 return;
             }
             issue(j, tok);
@@ -1174,6 +1253,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             j.finish = "length";
             j.produced = 0;
             j.cnt = (uint64_t) ++counter;
+            j.drafts = (j.r.spec < 0 ? spec : j.r.spec != 0) && m.draft_block() > 0;
+            j.round_due = j.round_asked = j.cool = false;
+            j.d_off = j.d_acc = 0;
             j.in_think = j.r.think_budget > 0 && j.r.think_end >= 0;
             m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
             j.s0 = m.stats();
@@ -1217,6 +1299,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             j.limit = j.r.max_new > 0 ? j.r.max_new : m.seq_context(j.lane) - (long long) j.r.ids.size();
             j.used = true;
             j.reading = true;
+            if (read_pieces) read_fifo.push_back(j.lane);
             ++active;
             age[(size_t) j.lane] = ++clock;
         };
@@ -1360,6 +1443,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 j.reading = false;
                 first_token(j);
             }
+            for (Job& j : jobs)   // (a drafting conversation owed a round: one, the read paused)
+                if (j.used && !j.reading && j.drafts && j.round_due) draft_round(j);
             m.seq_bind(reading_job->lane);
             if (gap_failed) return 2;
             // (the overrun bound is the decode's - a prompt read here in windows is its own, measured cheaper than its
@@ -1445,10 +1530,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             return false;
         };
         auto pick_read = [&]() -> int {   // the next read's lane (-1: none)
-            static const bool by_arrival = [] {
-                const char* v = std::getenv("MAYA_DS4_READ_ORDER");
-                return v != nullptr && std::strcmp(v, "arrival") == 0;
-            }();
+            if (read_pieces) {
+                while (!read_fifo.empty() && !(jobs[(size_t) read_fifo.front()].used && jobs[(size_t) read_fifo.front()].reading))
+                    read_fifo.pop_front();
+                return read_fifo.empty() ? -1 : read_fifo.front();
+            }
+            const bool by_arrival = read_order == "arrival";
             const double now = now_ms();
             const auto ratio = [&](const Job& j) {   // (no rate yet: the fewest tokens left, as a ratio)
                 const double left = (double) std::max<size_t>(1, j.total - j.done);
@@ -1471,7 +1558,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             return reading;
         };
         auto answers_before_read = [&]() -> bool {   // the soonest answer ends before the next read would
-            if (!gaps_adaptive || decode_round_ms <= 0.0 || read_tok_ms <= 0.0) return false;
+            if (read_pieces || !gaps_adaptive || decode_round_ms <= 0.0 || read_tok_ms <= 0.0) return false;
             const int next = pick_read();
             const double soonest = soonest_answer_ms();
             if (next < 0 || soonest < 0.0) return false;
@@ -1485,6 +1572,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 read_wanted = false;
                 const int reading = pick_read();
                 if (reading < 0) return;
+                if (read_pieces) read_fifo.pop_front();
                 Job& j = jobs[(size_t) reading];
                 m.seq_bind(j.lane);
                 if (j.stopping) {
@@ -1493,6 +1581,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     j.reading = false;
                     first_token(j);
                 }
+                if (read_pieces && j.used && j.reading) read_fifo.push_back(j.lane);   // (its next piece: the back)
             });
         };
         kick_read = [&] { eng.add([&] { schedule_read(); }, kRead); };
@@ -1517,9 +1606,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 return;
             }
             issuing = true;
-            int answering = 0;
+            int answering = 0;   // (the ones a token a window; a drafting one's rounds are owners of their own)
             for (Job& j : jobs)
-                if (j.used && !j.reading) ++answering;
+                if (j.used && !j.reading && !j.drafts) ++answering;
             reissue();
             round_left = in_flight > 0 ? answering : 0;
             round_t0 = now_ms();

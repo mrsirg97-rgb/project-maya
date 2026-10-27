@@ -5106,8 +5106,8 @@ struct Model::Impl {
                              "conversation's requests and answers never share a slot with another's\n",
                      mail.places, mail.ring, (double) ((uint64_t) mail.slots() * (sizeof(Req) + sizeof(Resp))) / 1e6);
         if (g.n_mtp > 0)
-            std::fprintf(stderr, "ds4 multi: the DSpark drafter does not run with several conversations - every answer is "
-                                 "a token a window (--dspark none keeps its blocks out of the load)\n");
+            std::fprintf(stderr, "ds4 multi: the DSpark drafter drafts for each conversation that asks (spec), a round at a "
+                                 "time - its drafts verified in one window, the GPUs its own for that round\n");
         return true;
     }
 
@@ -10635,9 +10635,6 @@ struct Model::Impl {
     bool draft_(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err) {
         out.clear();
         conf.clear();
-        // (several conversations: the drafter does not run - every answer is a token a window, as the load's log says;
-        // its blocks' requests would be numbered in the one conversation's order the devices no longer keep)
-        if (!lanes.empty()) return true;
         const int T = g.d_block, D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank;
         const int64_t p0 = pos;
         if (g.n_mtp == 0 || T < 1 || T > kWin || p0 + T > o.max_context) return true;
@@ -10657,8 +10654,9 @@ struct Model::Impl {
             dp.seq[il] = 0;
             dp.slot[il] = 0;
             if (host_free(L[(size_t) il])) continue;
-            dp.seq[il] = ++seq_issued;
-            dp.slot[il] = mail.slot(0, dp.seq[il]);
+            // (the bound conversation's numbering, as a window's: several conversations each number their own, Mail)
+            dp.seq[il] = lanes.empty() ? ++seq_issued : ++lane_seq[(size_t) cur_seq];
+            dp.slot[il] = mail.slot(lanes.empty() ? 0 : cur_seq, dp.seq[il]);
             layer_of[(size_t) dp.slot[il]].store(il, std::memory_order_release);
         }
         const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
@@ -13189,6 +13187,10 @@ struct Model::Impl {
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1, int lane = -1,
                  bool pick = false) {
+        // (several conversations: the bound one's window in its own lane's buffers - its hand-offs, staging and Engram
+        //  rows - as a multi_issue window is: a drafting round or a prompt's windows inside a read's gap must not touch
+        //  the paused read's staging, which the one conversation's buffers share)
+        if (lane < 0 && !lanes.empty()) lane = cur_seq;
         if (T < 1 || T > kWin) {
             err = "a window of " + std::to_string(T) + " tokens";
             return false;
@@ -13420,7 +13422,7 @@ struct Model::Impl {
                 }
                 if (x.n > 0) xfer_get(x, sflag, wp.win, s);
             }
-            if (mi == 0 && lane < 0 && !tap(d, il, T, err)) return false;   // (the drafter's: no lane drafts)
+            if (mi == 0 && !pick && !tap(d, il, T, err)) return false;   // (the drafter's: not a multi_issue window's)
             if (!layer(L0, mi, p0, T, wp, err, lane)) return false;
             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
@@ -14171,6 +14173,7 @@ bool Model::feed_windows(int lane, const int* tokens, int n, int logits_rows, st
 }
 int Model::prompt_chunk() const { return p_->chunk; }
 int Model::window_rows() const { return kWin; }
+int Model::pipeline_stages() const { return std::max(1, (int) p_->groups.size()); }
 double Model::window_s() const { return p_->pm.win_n > 0 ? p_->pm.win_s : 0.0; }
 PrefillGaps Model::prefill_gaps() const { return p_->gaps; }
 void Model::set_prefill_gap(std::function<int()> f) { p_->prefill_gap = std::move(f); }

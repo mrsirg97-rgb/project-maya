@@ -124,6 +124,9 @@ public:
     /// in windows costs, measured (the multi loop's gap reads a short new prompt in windows only when that is quicker
     /// than its turn in chunks).
     int window_rows() const;
+    /// The split's pipeline stages (its groups of GPUs, one after another): a read of that many chunks keeps them all
+    /// busy - the multi loop's read pieces (MAYA_DS4_READ_ORDER=pieces) are that many chunks.
+    int pipeline_stages() const;
     double window_s() const;
     /// The decode gaps of a prompt read (MAYA_DS4_PREFILL_GAPS), and the gap the serve loop runs at a boundary:
     /// `wanted` says whether this boundary is due, `gap` runs it (0 go on, 1 the read was stopped, 2 failed).
