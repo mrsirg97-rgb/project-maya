@@ -10,6 +10,9 @@ struct Geometry {
     int gu_type = -1, d_type = -1;
     size_t gu_row = 0, d_row = 0, up_off = 0, down_off = 0;
     float limit = 0;
+    int n_embd = 0, n_ff = 0;   // 0: GLM's 4096 / 2048; DeepSeek-V4.1: 5120 / 2304
+    size_t gate_off = 0;        // the gate's rows from the expert's start (GLM: 0)
+    size_t h_ld = 0;            // the bytes of an H row (gate / up's output, down's input; 0: packed, act_bytes(1, n_ff))
 };
 
 // Default on only on validated gfx1151 and gfx1100 with compiled WMMA bodies and covered types.
@@ -25,5 +28,12 @@ void quantize(const float* x, int64_t rows, int64_t cols, void* xa, void* stream
 void experts(const uint8_t* wbase, size_t stride, const Geometry& geometry,
              int n_expert, const int* bounds, const int* host_bounds, void* tiles, const void* xa,
              const int* src, void* ha, float* out, void* stream);
+// the two passes apart (the caller's own buffers between them; src nullptr: xa holds the rows in their order)
+void experts_gate_up(const uint8_t* wbase, size_t stride, const Geometry& geometry, int n_expert, const int* bounds,
+                     const int* host_bounds, void* tiles, const void* xa, const int* src, void* ha, void* stream);
+void experts_down(const uint8_t* wbase, size_t stride, const Geometry& geometry, int n_expert, const int* bounds,
+                  const int* host_bounds, void* tiles, const void* ha, float* out, void* stream);
+// quantize's int8 rows of the rows idx[r] of x (ldx floats apart), packed in that order
+void quantize_rows(const float* x, int64_t ldx, const int* idx, int64_t rows, int64_t cols, void* xa, void* stream);
 
 } // namespace strata::prefill::rdna4

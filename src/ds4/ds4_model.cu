@@ -5312,6 +5312,7 @@ struct Model::Impl {
                 x3::SetArgs sa;
 #if defined(STRATA_USE_HIP)
                 gg::iq::MmqRowsScope mmq_rows(nrows, b + i0);
+                gg::iq::FusedScratchScope fused_x(c.y, (size_t) c.C * D * sizeof(float));   // (the int8 rows)
 #endif
                 sa.wbase = wbase + (size_t) (i0 - wb0) * stride;   // (wbase: set member wb0's blob)
                 sa.stride = stride;

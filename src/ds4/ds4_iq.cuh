@@ -114,6 +114,18 @@ private:
     int previous_rows_;
     const int* previous_bounds_;
 };
+// The prompt set's scratch for its int8 activations (the fused experts, STRATA_DS4_PREFILL_FUSED): the caller's down
+// output rows, which the set's gate / up leaves unused until its down writes them; nested scopes restore their caller's.
+class FusedScratchScope {
+public:
+    FusedScratchScope(void* scratch, size_t bytes);
+    ~FusedScratchScope();
+    FusedScratchScope(const FusedScratchScope&) = delete;
+    FusedScratchScope& operator=(const FusedScratchScope&) = delete;
+private:
+    void* previous_;
+    size_t previous_bytes_;
+};
 #endif
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);

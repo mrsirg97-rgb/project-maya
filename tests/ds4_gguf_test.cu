@@ -1173,6 +1173,77 @@ constexpr int kQPairIQ1 = 9;   // (the first IQ1 pair)
 
 // a token's 6 low-bit experts at full size: GB/s of the weights read (only: the token experts of the first pair - the
 // reference - and of the pairs with a type whose name holds it, e.g. "IQ1"; no prompt sets)
+// --bench-set [rows]: the prompt path's expert sets of the low-bit pairs a GGUF of DeepSeek-V4.1 uses (GSQ-RCO
+// IQ2_XXS: IQ1_M / IQ2_XXS / IQ2_XS) - 64 experts x rows each, random activations - their median time of 7, TFLOP/s and
+// an FNV-1a hash of the FP16 H and the F32 Y (the same hash: the same arithmetic)
+void bench_set(cudaStream_t s, int R) {
+    using namespace gg::iq;
+    const int D = 5120, F = 2304, NE = 64;
+    const std::pair<int, int> pairs[] = {{kIQ1_M, kIQ1_M}, {kIQ2_XXS, kIQ1_M}, {kIQ2_XXS, kIQ2_XXS}, {kIQ2_XS, kIQ2_XS}};
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    std::vector<float> x((size_t) NE * R * D);
+    uint32_t r = 12345u;
+    for (float& v : x) {
+        r = r * 1664525u + 1013904223u;
+        v = ((float) (r >> 9) / 8388608.0f - 1.0f) * 0.5f;
+    }
+    std::vector<int> bounds(NE + 1), idx(NE * R);
+    for (int e = 0; e <= NE; ++e) bounds[e] = e * R;
+    for (int i = 0; i < NE * R; ++i) idx[i] = (int) (((long long) i * 7919) % (NE * R));   // (rows gathered out of order)
+    int *db = dev(bounds), *di = dev(idx);
+    float* xs = dev(x);
+    uint16_t* h16 = dev(std::vector<uint16_t>((size_t) NE * R * F));
+    float* y = dev(std::vector<float>((size_t) NE * R * D));
+    for (const auto& pr : pairs) {
+        QExperts E = make_q(D, F, NE, pr.first, pr.second);
+        x3::SetArgs sa;
+        sa.wbase = E.dev;
+        sa.stride = E.blob;
+        sa.lay = E.lay;
+        sa.n_exp = NE;
+        sa.bounds = db;
+        sa.max_rows = R;
+        sa.n_embd = D;
+        sa.n_ff = F;
+        sa.limit = 10.0f;
+        std::vector<float> gu_ms, dn_ms;
+        for (int i = 0; i < 8; ++i) {
+            cudaEventRecord(a, s);
+            gg::set_gate_up(sa, xs, D, di, h16, F, s);
+            cudaEventRecord(b, s);
+            CU(cudaEventSynchronize(b));
+            float ms = 0;
+            cudaEventElapsedTime(&ms, a, b);
+            if (i > 0) gu_ms.push_back(ms);
+            cudaEventRecord(a, s);
+            gg::set_down(sa, h16, F, y, D, s);
+            cudaEventRecord(b, s);
+            CU(cudaEventSynchronize(b));
+            cudaEventElapsedTime(&ms, a, b);
+            if (i > 0) dn_ms.push_back(ms);
+        }
+        std::sort(gu_ms.begin(), gu_ms.end());
+        std::sort(dn_ms.begin(), dn_ms.end());
+        const double g = gu_ms[gu_ms.size() / 2], d = dn_ms[dn_ms.size() / 2];
+        std::vector<uint16_t> hh((size_t) NE * R * F);
+        std::vector<uint32_t> yy((size_t) NE * R * D);
+        CU(cudaMemcpy(hh.data(), h16, hh.size() * 2, cudaMemcpyDeviceToHost));
+        CU(cudaMemcpy(yy.data(), y, yy.size() * 4, cudaMemcpyDeviceToHost));
+        uint64_t hash = 0xcbf29ce484222325ull;
+        for (uint16_t v : hh) hash = (hash ^ v) * 0x100000001b3ull;
+        for (uint32_t v : yy) hash = (hash ^ v) * 0x100000001b3ull;
+        const double fl = 2.0 * NE * R * (double) D * F;   // one matrix's FLOPs
+        std::printf("bench-set %-8s/%-8s %d experts x %d rows: gate/up %7.2f ms (%5.1f TFLOP/s), down %7.2f ms (%5.1f "
+                    "TFLOP/s), hash %016llx\n",
+                    tn(pr.first), tn(pr.second), NE, R, g, 2 * fl / (g * 1e-3) / 1e12, d, fl / (d * 1e-3) / 1e12,
+                    (unsigned long long) hash);
+        cudaFree(E.dev);
+    }
+    cudaFree(db), cudaFree(di), cudaFree(xs), cudaFree(h16), cudaFree(y);
+}
+
 void bench_q(cudaStream_t s, const char* only = nullptr) {
     cudaEvent_t a, b;
     cudaEventCreate(&a);
@@ -2402,6 +2473,10 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::strcmp(argv[1], "--bench-q") == 0) {   // [a type name's part: those pairs' token experts]
         bench_q(s, argc >= 3 ? argv[2] : nullptr);
+        return 0;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--bench-set") == 0) {   // [rows a set expert, 128]
+        bench_set(s, argc >= 3 ? std::atoi(argv[2]) : 128);
         return 0;
     }
     if (argc >= 2 && std::strcmp(argv[1], "--bench-cpu") == 0) {   // [threads]

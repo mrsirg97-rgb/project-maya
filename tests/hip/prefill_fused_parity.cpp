@@ -18,7 +18,8 @@
 
 namespace rf = strata::prefill::rdna4;
 namespace mq = strata::prefill::mmq;
-constexpr int E = 4096, FF = 2048, R = 83, A = 9;
+int E = 4096, FF = 2048;   // GLM-5.3-Flash's experts; DeepSeek-V4.1's: 5120 / 2304
+constexpr int R = 83, A = 9;
 
 void ck(hipError_t e) { if (e != hipSuccess) throw std::runtime_error(hipGetErrorString(e)); }
 struct Dev {
@@ -32,10 +33,17 @@ void fill(uint8_t* dst, ggml_type type, int rows, int cols, std::mt19937& rng) {
     const size_t bs = ggml_type_size(type), nb = (size_t) rows * cols / ggml_blck_size(type);
     for (size_t i = 0; i < nb * bs; ++i) dst[i] = (uint8_t) rng();
     const float lo = type == GGML_TYPE_IQ4_XS ? 0.00005f : type == GGML_TYPE_IQ4_NL ? 0.0002f :
-                     type == GGML_TYPE_Q2_0 ? 0.004f : type == GGML_TYPE_IQ3_S ? 0.0004f : 0.0008f;
+                     type == GGML_TYPE_Q2_0 ? 0.004f : type == GGML_TYPE_IQ3_S ? 0.0004f : type == GGML_TYPE_IQ1_M ? 0.002f : 0.0008f;
     for (size_t b = 0; b < nb; ++b) {
         const auto h = ggml_fp32_to_fp16(lo * (1.0f + (rng() % 500) / 100.0f));
-        std::memcpy(dst + b * bs, &h, 2);
+        if (type == GGML_TYPE_IQ1_M) {   // (its F16 scale: the top nibbles of the 4 scale words, bytes 48..55)
+            uint16_t sc[4], hb;
+            std::memcpy(&hb, &h, 2);
+            std::memcpy(sc, dst + b * bs + 48, 8);
+            for (int k = 0; k < 4; ++k) sc[k] = (uint16_t) ((sc[k] & 0x0FFF) | (((hb >> (4 * k)) & 0xF) << 12));
+            std::memcpy(dst + b * bs + 48, sc, 8);
+        } else
+            std::memcpy(dst + b * bs, &h, 2);
     }
 }
 
@@ -48,10 +56,14 @@ double relative(const std::vector<float>& a, const std::vector<float>& b) {
     return std::sqrt(num / std::max(den, 1e-30));
 }
 
-void run(ggml_type gu_type, ggml_type d_type, float limit = 1.25f) {
+// mmq_bound < 0: MMQ covers both formats and is the reference; else (IQ1_M: no MMQ) the bound on fused/FP32 - 1.5 x
+// the largest MMQ/FP32 of the covered pairs at this limit (the same int8 activations).  Returns MMQ/FP32 (0: no MMQ).
+double run(ggml_type gu_type, ggml_type d_type, float limit = 1.25f, double mmq_bound = -1.0) {
     if (!rf::supported(gu_type, d_type)) throw std::runtime_error("requires gfx1151 or gfx1100 and fused enabled");
     std::mt19937 rng(1570 + gu_type * 17 + d_type);
     rf::Geometry geo{gu_type, d_type, ggml_row_size(gu_type, E), ggml_row_size(d_type, FF), 0, 0, limit};
+    if (E != 4096) geo.n_embd = E, geo.n_ff = FF;
+    const bool have_mmq = mmq_bound < 0;
     geo.up_off = FF * geo.gu_row; geo.down_off = 2 * geo.up_off;
     const size_t blob = geo.down_off + E * geo.d_row;
     const size_t unit = std::lcm(ggml_type_size(gu_type), ggml_type_size(d_type));
@@ -78,6 +90,7 @@ void run(ggml_type gu_type, ggml_type d_type, float limit = 1.25f) {
     ck(hipMemcpy(di.p, ident.data(), ident.size()*4, hipMemcpyHostToDevice));
     ck(hipMemcpy(db.p, bounds.data(), bounds.size()*4, hipMemcpyHostToDevice));
     mq::Context ctx;
+    if (have_mmq) {
     mq::quantize(dx.as<float>(), ds.as<int>(), xq.p, gu_type, E,E,R,nullptr);
     mq::Product gp;
     gp.w=dw.as<uint8_t>()+2; gp.type=gu_type; gp.w_rows=2*FF; gp.w_cols=E; gp.expert_bytes=stride;
@@ -90,6 +103,7 @@ void run(ggml_type gu_type, ggml_type d_type, float limit = 1.25f) {
     dp.w=dw.as<uint8_t>()+2+geo.down_off; dp.type=d_type; dp.w_rows=E; dp.w_cols=FF;
     dp.xq=hq.as<uint8_t>()-A*mq::q8_block_bytes(); dp.dst=mm.as<float>()-(size_t)A*E; dp.ld_dst=E;
     ctx.run(dp,nullptr);
+    }
     ck(hipMemset(out.p,0xff,(size_t)R*E*4));
     rf::quantize(dx.as<float>(),R,E,xa.p,nullptr);
     // Split launches mimic resident and staged sets; the second begins at bound A+66.
@@ -99,7 +113,26 @@ void run(ggml_type gu_type, ggml_type d_type, float limit = 1.25f) {
     ck(hipDeviceSynchronize());
     std::vector<float> fused((size_t)R*E), mmq(fused.size());
     ck(hipMemcpy(fused.data(),out.p,fused.size()*4,hipMemcpyDeviceToHost));
-    ck(hipMemcpy(mmq.data(),mm.p,mmq.size()*4,hipMemcpyDeviceToHost));
+    {   // the split passes (DeepSeek's path): the rows gathered into xa in their order (no src), H at a row stride of
+        // 2 FF bytes (an FP16 row's room) - the same arithmetic, so the same bits as the combined passes above
+        Dev xg(rf::act_bytes(R,E)), hs((size_t)R*FF*2), o2((size_t)R*E*4);
+        ck(hipMemset(o2.p,0xff,(size_t)R*E*4));
+        rf::Geometry g2 = geo;
+        g2.h_ld = (size_t) FF * 2;
+        rf::quantize_rows(dx.as<float>(), E, ds.as<int>(), R, E, xg.p, nullptr);
+        rf::experts_gate_up(dw.as<uint8_t>()+2,stride,g2,2,db.as<int>(),bounds.data(),tiles.p,xg.p,nullptr,hs.p,nullptr);
+        rf::experts_down(dw.as<uint8_t>()+2,stride,g2,2,db.as<int>(),bounds.data(),tiles.p,hs.p,o2.as<float>(),nullptr);
+        rf::experts_gate_up(dw.as<uint8_t>()+2+2*stride,stride,g2,2,db.as<int>()+2,bounds.data()+2,tiles.p,
+                            xg.as<uint8_t>()+rf::act_bytes(66,E),nullptr,hs.as<uint8_t>()+(size_t)66*FF*2,nullptr);
+        rf::experts_down(dw.as<uint8_t>()+2+2*stride,stride,g2,2,db.as<int>()+2,bounds.data()+2,tiles.p,
+                         hs.as<uint8_t>()+(size_t)66*FF*2,o2.as<float>()+66*E,nullptr);
+        ck(hipDeviceSynchronize());
+        std::vector<float> split((size_t)R*E);
+        ck(hipMemcpy(split.data(),o2.p,split.size()*4,hipMemcpyDeviceToHost));
+        if (std::memcmp(split.data(), fused.data(), split.size()*4) != 0) throw std::runtime_error("split passes differ");
+    }
+    if (have_mmq) ck(hipMemcpy(mmq.data(),mm.p,mmq.size()*4,hipMemcpyDeviceToHost));
+    else mmq = fused;   // (no MMQ: its comparisons are the fused rows themselves)
     std::vector<uint8_t> hidden(rf::act_bytes(R,FF));
     ck(hipMemcpy(hidden.data(),ha.p,hidden.size(),hipMemcpyDeviceToHost));
     // Decode the stored H independently: 64 int8 codes, two FP32 scales per block.
@@ -143,10 +176,12 @@ void run(ggml_type gu_type, ggml_type d_type, float limit = 1.25f) {
         }
     }
     const double ferr=relative(fs,ref), merr=relative(ms,ref), herr=relative(hs,href), derr=relative(fs,dref);
-    std::cout << ggml_type_name(gu_type) << '/' << ggml_type_name(d_type)
+    std::cout << "E=" << E << ' ' << ggml_type_name(gu_type) << '/' << ggml_type_name(d_type)
               << " limit=" << limit << ": fused/MMQ=" << diff << " fused/FP32=" << ferr << " MMQ/FP32=" << merr
               << " GU-H/FP32=" << herr << " down/FP32(H)=" << derr << '\n';
-    if (derr>0.00001 || diff>0.03 || ferr>std::max(0.002,1.5*merr)) throw std::runtime_error("fused parity failed");
+    if (derr>0.00001 || (have_mmq && (diff>0.03 || ferr>std::max(0.002,1.5*merr))) || (!have_mmq && ferr>mmq_bound))
+        throw std::runtime_error("fused parity failed");
+    return have_mmq ? merr : 0.0;
 }
 
 int main() {
@@ -156,11 +191,27 @@ int main() {
             std::cout << "SKIP: fused experts need compiled gfx1151 or gfx1100 kernels and the switch enabled\n";
             return 77;
         }
-        for(float limit:{1.25f,100.0f})
-            for(auto gt:{GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS,GGML_TYPE_IQ2_S,
-                         GGML_TYPE_IQ3_XXS,GGML_TYPE_IQ3_S,GGML_TYPE_IQ4_XS})
-                for(auto dt:{GGML_TYPE_Q2_0,GGML_TYPE_IQ4_NL,GGML_TYPE_IQ2_S,GGML_TYPE_IQ3_XXS}) run(gt,dt,limit);
-        std::cout << "PASS: all 24 pairs at two clamp limits, GU/down products, zero rows, offsets, empty experts and tile boundaries\n";
+        const ggml_type gus[] = {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                                 GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_M};
+        const ggml_type downs[] = {GGML_TYPE_Q2_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
+                                   GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS};
+        int pairs = 0;
+        for (int shape = 0; shape < 2; ++shape) {   // GLM-5.3-Flash's experts, then DeepSeek-V4.1's
+            E = shape ? 5120 : 4096;
+            FF = shape ? 2304 : 2048;
+            for (float limit : {1.25f, 100.0f}) {
+                double worst = 0;   // the covered pairs' largest MMQ/FP32: the IQ1_M pairs' bound (x 1.5)
+                for (auto gt : gus)
+                    for (auto dt : downs)
+                        if (mq::supported(gt) && mq::supported(dt)) worst = std::max(worst, run(gt, dt, limit)), ++pairs;
+                for (auto gt : gus)
+                    for (auto dt : downs)
+                        if (!(mq::supported(gt) && mq::supported(dt))) run(gt, dt, limit, std::max(0.002, 1.5 * worst)), ++pairs;
+            }
+        }
+        std::cout << "PASS: " << pairs << " runs, the split passes bit for bit (" << sizeof(gus) / sizeof(gus[0]) * sizeof(downs) / sizeof(downs[0])
+                  << " pairs x 2 clamp limits x GLM's and DeepSeek's shapes), GU/down products, zero rows, offsets, empty "
+                     "experts and tile boundaries\n";
         return 0;
     } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

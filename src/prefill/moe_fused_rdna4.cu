@@ -57,29 +57,31 @@ constexpr int AB = 80;                  // activation bytes per 64 values: 64 co
 constexpr int MAGIC = 0x4B400000;       // the bits of 1.5 * 2^23
 constexpr float MAGICF = 12582912.0f;
 constexpr int WLD = 80; // 64 decoded int8 weights plus padding to avoid LDS bank conflicts
-constexpr int GU_ROWS_K = 4096, D_ROWS_K = 2048;   // K of gate/up (n_embd) and of down (n_ff)
+// the model's shape is the kernel's: E = n_embd (gate / up's K, down's rows), FF = n_ff (down's K, gate / up's rows)
 
 // the formats (ggml type ids)
 constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_S = GGML_TYPE_IQ2_S,
               T_IQ3_XXS = GGML_TYPE_IQ3_XXS, T_IQ3_S = GGML_TYPE_IQ3_S, T_IQ4_XS = GGML_TYPE_IQ4_XS,
-              T_IQ4_NL = GGML_TYPE_IQ4_NL, T_Q2_0 = GGML_TYPE_Q2_0;
+              T_IQ4_NL = GGML_TYPE_IQ4_NL, T_Q2_0 = GGML_TYPE_Q2_0, T_IQ1_M = GGML_TYPE_IQ1_M;
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 && sizeof(block_iq2_s) == 82 &&
               sizeof(block_iq3_xxs) == 98 && sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 &&
-              sizeof(block_iq4_nl) == 18 && sizeof(block_q2_0) == 18,
+              sizeof(block_iq4_nl) == 18 && sizeof(block_q2_0) == 18 && sizeof(block_iq1_m) == 56,
               "the block layouts this file decodes");
 
 // block bytes, scale per 16 values, codebook bytes in shared memory
 __host__ __device__ constexpr int block_bytes(int t) {
     return t == T_IQ2_XXS ? 66 : t == T_IQ2_XS ? 74 : t == T_IQ2_S ? 82 : t == T_IQ3_XXS ? 98 : t == T_IQ3_S ? 110
-         : t == T_IQ4_XS ? 136 : 18;
+         : t == T_IQ4_XS ? 136 : t == T_IQ1_M ? 56 : 18;
 }
 // These covered formats have no additive minimum and need at most five raw words.
 __host__ __device__ constexpr bool has_min(int) { return false; }
 __host__ __device__ constexpr int raw_words(int) { return 5; }
-__host__ __device__ constexpr bool per16(int t) { return t == T_IQ2_XS || t == T_IQ2_S; }
+__host__ __device__ constexpr bool per16(int t) { return t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ1_M; }
+// the 256-value super-blocks (every IQ format here but IQ4_NL): a 64-value stage is a quarter of one
+__host__ __device__ constexpr bool super256(int t) { return t != T_IQ4_NL && t != T_Q2_0; }
 __host__ __device__ constexpr int grid_bytes(int t) {
     return t == T_IQ2_XXS ? 256 * 8 : t == T_IQ2_XS ? 512 * 8 : t == T_IQ2_S ? 1024 * 8 : t == T_IQ3_XXS ? 256 * 4
-         : t == T_IQ3_S ? 512 * 4 : 0;
+         : t == T_IQ3_S ? 512 * 4 : t == T_IQ1_M ? 2048 * 4 : 0;
 }
 // ---- activations in natural order: one warp per 64 values
 __global__ void quant_act_nat_kernel(const float* __restrict__ x, int64_t nblk, uint8_t* __restrict__ xa) {
@@ -98,6 +100,33 @@ __global__ void quant_act_nat_kernel(const float* __restrict__ x, int64_t nblk, 
     out[lane] = (uint8_t) (int8_t) c0;
     out[32 + lane] = (uint8_t) (int8_t) c1;
     int s0 = c0, s1 = c1;   // the codes' sums per 32 values (the formats with a minimum read them)
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        s0 += __shfl_xor_sync(0xffffffffu, s0, o, 32);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, o, 32);
+    }
+    if (lane == 0) *(float4*) (out + 64) = make_float4(a0 / 127.0f, a1 / 127.0f, (float) s0, (float) s1);
+}
+
+// ... of the rows idx[r] of x (ldx apart), packed in that order: a set's routed rows for the rows' own order (no src)
+__global__ void quant_rows_nat_kernel(const float* __restrict__ x, int64_t ldx, const int* __restrict__ idx, int bpr,
+                                      int64_t nblk, uint8_t* __restrict__ xa) {
+    const int64_t w = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (w >= nblk) return;
+    const float* xr = x + (size_t) idx[w / bpr] * ldx + (size_t) (w % bpr) * 64;
+    const float v0 = xr[lane], v1 = xr[32 + lane];
+    float a0 = fabsf(v0), a1 = fabsf(v1);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, o, 32));
+        a1 = fmaxf(a1, __shfl_xor_sync(0xffffffffu, a1, o, 32));
+    }
+    uint8_t* out = xa + w * AB;
+    const int c0 = a0 > 0.0f ? __float2int_rn(v0 * (127.0f / a0)) : 0, c1 = a1 > 0.0f ? __float2int_rn(v1 * (127.0f / a1)) : 0;
+    out[lane] = (uint8_t) (int8_t) c0;
+    out[32 + lane] = (uint8_t) (int8_t) c1;
+    int s0 = c0, s1 = c1;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         s0 += __shfl_xor_sync(0xffffffffu, s0, o, 32);
@@ -202,6 +231,9 @@ template <int T, int NW> __device__ __forceinline__ void load_unit(const uint8_t
 #pragma unroll
         for (int k = 0; k < 4; ++k) w[k] = ld32(bp + 2 + 4 * k);
         w[4] = ld16(bp);
+    } else if constexpr (T == T_IQ1_M) {   // qs[32], qh[16] (a byte for two groups of 8), scales[8] (d's nibbles in their tops)
+        w[0] = ld32(bp + 4 * ib); w[1] = ld16(bp + 32 + 2 * ib); w[2] = ld32(bp + 48); w[3] = ld32(bp + 52);
+        w[4] = (uint32_t) ib;
     } else {   // Q2_0
         w[0] = ld32(bp + 2 + 8 * ib); w[1] = ld32(bp + 6 + 8 * ib); w[2] = ld16(bp);
     }
@@ -282,6 +314,24 @@ __device__ __forceinline__ void convert(const uint32_t (&w)[NW], const uint8_t* 
 #endif
         }
         s0 = s1 = half_at(w[3]) * (float) (1 + 2 * (w[3] >> 24));
+    } else if constexpr (T == T_IQ1_M) {
+        // as DeepSeek's iq1_decode (src/ds4/ds4_iq.cu): a value d s (g + delta) with g in {-1, 0, 1} and delta +-1/8 is the
+        // int8 code 8 g +- 1 times d s / 8 - iq1s_grid_gpu's nibble n = g + 1 times 8 in bits 3..6 of each byte, biased by
+        // 0x79 (+1/8: 8 n - 7) or 0x77 (-1/8: 8 n - 9), the top bit flipped back (no byte carries into the next)
+        const uint32_t* g = (const uint32_t*) grid;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {   // group l: index bits 4 l .. 4 l + 2 of qh, the delta's sign bit 4 l + 3
+            const uint32_t e = g[((w[0] >> (8 * l)) & 255u) | (((w[1] >> (4 * l)) & 7u) << 8)];
+            const uint32_t bias = (w[1] >> (4 * l + 3)) & 1u ? 0x77777777u : 0x79797979u;
+            q[2 * l] = (((e << 3) & 0x78787878u) + bias) ^ 0x80808080u;       // values 8 l .. 8 l + 3: the low nibbles
+            q[2 * l + 1] = (((e >> 1) & 0x78787878u) + bias) ^ 0x80808080u;   // 8 l + 4 .. 8 l + 7: the high ones
+        }
+        const uint32_t s01 = w[2], s23 = w[3], ib = w[4];
+        const uint32_t u = ((s01 >> 12) & 0xFu) | ((s01 >> 24) & 0xF0u) | ((s23 >> 4) & 0xF00u) | ((s23 >> 16) & 0xF000u);
+        const float d = half_at(u) * 0.125f;
+        const uint32_t sw = ((ib >> 1) < 2 ? s01 : s23) >> (16 * ((ib >> 1) & 1) + 6 * (ib & 1));
+        s0 = d * (float) (2 * (sw & 7u) + 1);          // values 0..15
+        s1 = d * (float) (2 * ((sw >> 3) & 7u) + 1);   // 16..31
     } else if constexpr (T == T_IQ4_XS || T == T_IQ4_NL) {
 #pragma unroll
         for (int k = 0; k < 4; ++k) table16(w[k], kv, q[k], q[4 + k]);
@@ -305,6 +355,7 @@ template <int T> __device__ __forceinline__ const void* grid_src() {
     else if constexpr (T == T_IQ2_S) return iq2s_grid;
     else if constexpr (T == T_IQ3_XXS) return iq3xxs_grid;
     else if constexpr (T == T_IQ3_S) return iq3s_grid;
+    else if constexpr (T == T_IQ1_M) return iq1s_grid_gpu;
     else return nullptr;
 }
 #endif
@@ -385,15 +436,18 @@ __device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
 
 // W (X1): ALIAS = the H tile lives on the weight buffers (one extra barrier); LB > 0 = amdgpu_waves_per_eu(LB) (VGPR cap).
 // Disable both with -DSTRATA_W_NO_OCC (the launch sites then use <WT, GU, false, 0> and grid factor wgp_blocks).
-template <int WT, bool GU, bool ALIAS = false, int LB = 0>
+template <int WT, bool GU, bool ALIAS = false, int LB = 0, int E = 4096, int FF = 2048>
 __global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
 native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles, const int* bounds,
                   const Geometry geo, const uint8_t* __restrict__ act,
                   const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
 #if STRATA_NAT_WMMA
-    constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;  // 64-value stages along K
-    constexpr int NFB = 4096 / NW_ROWS;     // work items per tile
-    constexpr int ACT_LD = NS * AB;
+    static_assert(E % NW_ROWS == 0 && (2 * FF) % NW_ROWS == 0 && E % 64 == 0 && FF % 64 == 0, "the shape's tiles");
+    constexpr int NS = (GU ? E : FF) / 64;  // 64-value stages along K
+    constexpr int NFB = (GU ? 2 * FF : E) / NW_ROWS;     // work items per tile
+    // the rows' bytes: gate / up's activations packed (NS blocks); down's H as gate / up wrote it (geo.h_ld, 0: packed)
+    const size_t ACT_LD = GU || geo.h_ld == 0 ? (size_t) NS * AB : geo.h_ld;
+    const size_t H_LD = geo.h_ld == 0 ? (size_t) (FF / 64) * AB : geo.h_ld;
     constexpr int BS = block_bytes(WT);
     constexpr bool K16 = per16(WT);
     constexpr int GB = grid_bytes(WT) > 0 ? grid_bytes(WT) : 16;
@@ -431,13 +485,13 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
         if (nrows <= 0) continue; // uniform for the block; no barriers are skipped by individual lanes
         const uint8_t* blob = wbase + (size_t) e * stride;
         const int rbase = fb * NW_ROWS;
-        const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
+        const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : geo.gate_off) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
         auto unit = [&](int s) -> const uint8_t* {
-            if (GU || WT == T_IQ2_S || WT == T_IQ3_XXS) return wrow + (s >> 2) * BS;
+            if (GU || super256(WT)) return wrow + (s >> 2) * BS;
             return (WT == T_IQ4_NL) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
         };
-        auto sub = [&](int s) { return (GU || WT == T_IQ2_S || WT == T_IQ3_XXS) ? 2 * (s & 3) + uj : uj; };
+        auto sub = [&](int s) { return (GU || super256(WT)) ? 2 * (s & 3) + uj : uj; };
         auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
             uint32_t q[8];
             float s0, s1;
@@ -450,7 +504,7 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
         __syncthreads();                                          // the previous item is done with the buffers
         if (tid < kTileRows) {
             const int r = row0 + min(tid, nrows - 1);             // rows past the tile's end repeat its last one
-            srow[tid] = GU ? src[r] : r;
+            srow[tid] = GU && src != nullptr ? src[r] : r;   // (no src: the activations in the rows' order)
         }
         uint32_t raw[raw_words(WT)] = {};
         load_unit<WT>(unit(0), sub(0), raw);
@@ -587,7 +641,7 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
 #pragma unroll 8
                     for (int j = 0; j < 32; ++j) am = fmaxf(am, fabsf(hs[r][32 * hh + j]));
                     const float inv = am > 0.0f ? 127.0f / am : 0.0f;
-                    uint8_t* o = out + (size_t) (row0 + r) * (32 * AB) + (size_t) fb * AB;
+                    uint8_t* o = out + (size_t) (row0 + r) * H_LD + (size_t) fb * AB;
                     uint32_t wd[8] = {};
                     int csum = 0;
 #pragma unroll
@@ -613,11 +667,11 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
                         if (r < nrows) {
 #if STRATA_NAT_W12
                             // columns rbase + 32 wm + 16 mt + 8 hi .. + 7: contiguous, 32-byte aligned (dm: 16, checked in experts_native)
-                            float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * 4096 + rbase + 32 * wm + 16 * mt + 8 * hi);
+                            float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * E + rbase + 32 * wm + 16 * mt + 8 * hi);
                             d[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
                             d[1] = make_float4(acc[mt][nt][4], acc[mt][nt][5], acc[mt][nt][6], acc[mt][nt][7]);
 #else
-                            float* d = dm + (size_t) (row0 + r) * 4096 + rbase + 32 * wm + 16 * mt + hi;
+                            float* d = dm + (size_t) (row0 + r) * E + rbase + 32 * wm + 16 * mt + hi;
 #pragma unroll
                             for (int i = 0; i < 8; ++i) d[2 * i] = acc[mt][nt][i];
 #endif
@@ -674,8 +728,10 @@ bool available() {
 }
 
 bool supported(int gu, int down) {
-    if (!(gu == T_IQ2_XXS || gu == T_IQ2_XS || gu == T_IQ2_S || gu == T_IQ3_XXS || gu == T_IQ3_S || gu == T_IQ4_XS) ||
-        !(down == T_Q2_0 || down == T_IQ4_NL || down == T_IQ2_S || down == T_IQ3_XXS)) return false;
+    if (!(gu == T_IQ2_XXS || gu == T_IQ2_XS || gu == T_IQ2_S || gu == T_IQ3_XXS || gu == T_IQ3_S || gu == T_IQ4_XS ||
+          gu == T_IQ1_M) ||
+        !(down == T_Q2_0 || down == T_IQ4_NL || down == T_IQ2_S || down == T_IQ3_XXS || down == T_IQ1_M ||
+          down == T_IQ2_XXS || down == T_IQ2_XS)) return false;
     return available();
 }
 
@@ -688,41 +744,79 @@ void quantize(const float* x, int64_t rows, int64_t cols, void* xa, void* stream
     ck(cudaGetLastError(), "quantize");
 }
 
-void experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int ne,
-             const int* bounds, const int* host_bounds, void* tile_scratch,
-             const void* xa, const int* src, void* ha, float* out, void* stream) {
+namespace {
+// gate / up (gu), down (dn) or both: the tiles of the experts' rows (each pass enumerates them into tile_scratch)
+void run_experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int ne, const int* bounds,
+                 const int* host_bounds, void* tile_scratch, const void* xa, const int* src, void* ha, float* out,
+                 void* stream, bool gu, bool dn) {
     if (ne <= 0) return;
-    if (ne > 512 || ((uintptr_t) out & 15)) std::abort();
+    if (ne > 512 || (dn && ((uintptr_t) out & 15))) std::abort();
     const auto d = device_info();
     if (!d.ok) std::abort();
     const int sms = d.sms;
     int ntiles = 0;
     for (int e = 0; e < ne; ++e) ntiles += (host_bounds[e+1] - host_bounds[e] + 63) / 64;
     if (!ntiles) return;
+    const bool ds4 = geo.n_embd == 5120 && geo.n_ff == 2304;   // (DeepSeek-V4.1's experts; else GLM's 4096 / 2048)
+    // blocks a multiprocessor: 3 for IQ2_S / IQ2_XS, else 4 - DeepSeek's shape on every GPU as well (a Radeon 8060S,
+    // hip_prefill_fused_bench ds4 at 9.5K tokens: IQ1_M / IQ1_M 223 ms at 4, 281 at 3; a prompt the same at 2 / 6)
     const int gu_blocks = geo.gu_type == T_IQ2_S || geo.gu_type == T_IQ2_XS ? 3 : 4;
+    const int dn_blocks = geo.d_type == T_IQ2_S ? 3 : 4;
     const unsigned grid_gu = (unsigned) std::min(ntiles * 32, sms * gu_blocks);
-    const unsigned grid_dn = (unsigned) std::min(ntiles * 32, sms * (geo.d_type == T_IQ2_S ? 3 : 4));
+    const unsigned grid_dn = (unsigned) std::min(ntiles * 32, sms * dn_blocks);
     const auto s = (cudaStream_t) stream;
+    if (!ds4 && ((geo.n_embd != 0 && geo.n_embd != 4096) || (geo.n_ff != 0 && geo.n_ff != 2048))) std::abort();
     auto* tiles = (int2*) tile_scratch;
     make_tiles_kernel<<<1, 256, 0, s>>>(bounds, ne, tiles);
-#define GU(T) native_kernel<T, true, true, NW_LB><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr)
-    switch (geo.gu_type) {
+#define GU(T) (ds4 ? native_kernel<T, true, true, NW_LB, 5120, 2304><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr) \
+                 : native_kernel<T, true, true, NW_LB><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr))
+    if (gu) switch (geo.gu_type) {
         case T_IQ2_XXS: GU(T_IQ2_XXS); break;
         case T_IQ2_XS: GU(T_IQ2_XS); break;
         case T_IQ2_S: GU(T_IQ2_S); break;
         case T_IQ3_XXS: GU(T_IQ3_XXS); break;
         case T_IQ3_S: GU(T_IQ3_S); break;
         case T_IQ4_XS: GU(T_IQ4_XS); break;
+        case T_IQ1_M: GU(T_IQ1_M); break;
         default: std::abort();
     }
 #undef GU
-#define DN(T) native_kernel<T, false, true, NW_LB><<<grid_dn, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) ha, src, nullptr, out)
-    if (geo.d_type == T_Q2_0) { DN(T_Q2_0); }
+#define DN(T) (ds4 ? native_kernel<T, false, true, NW_LB, 5120, 2304><<<grid_dn, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) ha, src, nullptr, out) \
+                 : native_kernel<T, false, true, NW_LB><<<grid_dn, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) ha, src, nullptr, out))
+    if (!dn) {}
+    else if (geo.d_type == T_Q2_0) { DN(T_Q2_0); }
     else if (geo.d_type == T_IQ4_NL) { DN(T_IQ4_NL); }
     else if (geo.d_type == T_IQ2_S) { DN(T_IQ2_S); }
     else if (geo.d_type == T_IQ3_XXS) { DN(T_IQ3_XXS); }
+    else if (geo.d_type == T_IQ1_M) { DN(T_IQ1_M); }
+    else if (geo.d_type == T_IQ2_XXS) { DN(T_IQ2_XXS); }
+    else if (geo.d_type == T_IQ2_XS) { DN(T_IQ2_XS); }
     else std::abort();
 #undef DN
     ck(cudaGetLastError(), "experts");
+}
+}  // namespace
+
+void experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int ne,
+             const int* bounds, const int* host_bounds, void* tile_scratch,
+             const void* xa, const int* src, void* ha, float* out, void* stream) {
+    run_experts(wbase, stride, geo, ne, bounds, host_bounds, tile_scratch, xa, src, ha, out, stream, true, true);
+}
+void experts_gate_up(const uint8_t* wbase, size_t stride, const Geometry& geo, int ne, const int* bounds,
+                     const int* host_bounds, void* tile_scratch, const void* xa, const int* src, void* ha, void* stream) {
+    run_experts(wbase, stride, geo, ne, bounds, host_bounds, tile_scratch, xa, src, ha, nullptr, stream, true, false);
+}
+void experts_down(const uint8_t* wbase, size_t stride, const Geometry& geo, int ne, const int* bounds,
+                  const int* host_bounds, void* tile_scratch, const void* ha, float* out, void* stream) {
+    run_experts(wbase, stride, geo, ne, bounds, host_bounds, tile_scratch, nullptr, nullptr, const_cast<void*>(ha), out,
+                stream, false, true);
+}
+void quantize_rows(const float* x, int64_t ldx, const int* idx, int64_t rows, int64_t cols, void* xa, void* stream) {
+    if (rows <= 0) return;
+    const int bpr = (int) (cols / 64);
+    const int64_t nblk = rows * bpr;
+    quant_rows_nat_kernel<<<(unsigned) ((nblk + 7) / 8), 256, 0, (cudaStream_t) stream>>>(x, ldx, idx, bpr, nblk,
+                                                                                         (uint8_t*) xa);
+    ck(cudaGetLastError(), "quantize rows");
 }
 } // namespace strata::prefill::rdna4

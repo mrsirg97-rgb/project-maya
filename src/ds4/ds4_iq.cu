@@ -4,6 +4,9 @@
 #include "ds4_pdl.cuh"
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
 #include "strata/prefill/moe_mmq.hpp"
+#if defined(STRATA_USE_HIP)
+#include "strata/prefill/moe_fused_rdna4.hpp"
+#endif
 #include <cstring>
 #include <map>
 #include <memory>
@@ -1787,8 +1790,122 @@ bool mmq_down(const SetArgs& a, cudaStream_t s) {
 
 #endif
 
+#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+// Prompt expert sets through the fused int8 experts the GLM prompt uses (strata::prefill::rdna4, gfx1151 / gfx1100 /
+// RDNA4): the weights decoded to int8 in the WMMA tiles' shared memory, the activations and the SwiGLU's H rounded to
+// int8 per 32 values (as GLM's), the products on the int8 matrix cores.  On by default where it covers the set's formats
+// (STRATA_DS4_PREFILL_FUSED=0: the FP16 tiles above).  The set's rows are gathered into the scratch of the caller's
+// FusedScratchScope (its down output: unused until the down writes it), H goes into the caller's FP16 rows at their
+// stride (2 n_ff bytes: an int8 row is act_bytes(1, n_ff)), and the down reads it there - both passes decide alike.
+namespace {
+thread_local void* fused_scratch = nullptr;
+thread_local size_t fused_scratch_bytes = 0;
+}
+FusedScratchScope::FusedScratchScope(void* scratch, size_t bytes)
+    : previous_(fused_scratch), previous_bytes_(fused_scratch_bytes) {
+    fused_scratch = scratch;
+    fused_scratch_bytes = bytes;
+}
+FusedScratchScope::~FusedScratchScope() {
+    fused_scratch = previous_;
+    fused_scratch_bytes = previous_bytes_;
+}
+namespace {
+// STRATA_DS4_PREFILL_FUSED: unset = on for gfx1151 (Strix / Gorgon Halo, where it is measured), 1 = on wherever the
+// fused experts run (gfx1100, RDNA4: not measured), 0 = off
+bool fused_on() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_DS4_PREFILL_FUSED");
+        return v == nullptr ? -1 : std::atoi(v) != 0 ? 1 : 0;
+    }();
+    if (mode >= 0) return mode == 1;
+    static std::mutex mu;
+    static std::map<int, bool> halo;   // (a device's answer, asked once)
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    std::lock_guard<std::mutex> lk(mu);
+    const auto it = halo.find(dev);
+    if (it != halo.end()) return it->second;
+    cudaDeviceProp prop{};
+    const bool on = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+    halo[dev] = on;
+    return on;
+}
+// (the same decision for the set's two passes: none of what it reads differs between them)
+bool fused_wanted(const SetArgs& a) {
+    if (!fused_on() || fused_scratch == nullptr || a.n_exp <= 0 || a.n_exp > 512 || !mmq_host_bounds || mmq_rows <= 0)
+        return false;
+    if (mmq_host_bounds[0] != a.row0 || mmq_host_bounds[a.n_exp] - a.row0 != mmq_rows) return false;
+    if (a.n_embd != 5120 || a.n_ff != 2304 || a.act != kActSwiglu || (a.tu != 0 && a.tu != a.tg) || a.skip_ge > 0)
+        return false;
+    if (fused_scratch_bytes < strata::prefill::rdna4::act_bytes(mmq_rows, a.n_embd)) return false;
+    return strata::prefill::rdna4::supported(a.tg, a.td);
+}
+strata::prefill::rdna4::Geometry fused_geo(const SetArgs& a, size_t h_ld) {
+    strata::prefill::rdna4::Geometry g;
+    g.gu_type = a.tg;
+    g.d_type = a.td;
+    g.gu_row = (size_t) (a.n_embd / 256) * (size_t) block_bytes(a.tg);
+    g.d_row = (size_t) (a.n_ff / 256) * (size_t) block_bytes(a.td);
+    g.gate_off = a.tr[0];
+    g.up_off = a.tr[1];
+    g.down_off = a.tr[2];
+    g.limit = a.limit;
+    g.n_embd = a.n_embd;
+    g.n_ff = a.n_ff;
+    g.h_ld = h_ld;
+    return g;
+}
+// the tiles' list (two ints a tile), a device's own: at most the rows' tiles and one partial tile an expert
+void* fused_tiles(int rows, int n_exp) {
+    static std::mutex mu;
+    static std::map<int, std::pair<void*, size_t>> per_dev;
+    const size_t need = ((size_t) rows / 64 + (size_t) n_exp + 8) * 2 * sizeof(int);
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    std::lock_guard<std::mutex> lk(mu);
+    auto& t = per_dev[dev];
+    if (t.second < need) {
+        if (t.first != nullptr) {
+            cudaDeviceSynchronize();
+            cudaFree(t.first);
+        }
+        t = {nullptr, 0};
+        if (cudaMalloc(&t.first, need) != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
+        t.second = need;
+    }
+    return t.first;
+}
+bool fused_gate_up(const SetArgs& a, cudaStream_t s) {
+    if (a.xf == nullptr || a.idx == nullptr || a.h == nullptr) return false;
+    void* tiles = fused_tiles(mmq_rows, a.n_exp);
+    if (tiles == nullptr) return false;
+    strata::prefill::rdna4::quantize_rows(a.xf, a.ldx, a.idx, mmq_rows, a.n_embd, fused_scratch, s);
+    strata::prefill::rdna4::experts_gate_up(a.wbase, a.stride, fused_geo(a, (size_t) a.ldo * 2), a.n_exp, a.bounds,
+                                            mmq_host_bounds, tiles, fused_scratch, nullptr, a.h, s);
+    return true;
+}
+bool fused_down(const SetArgs& a, cudaStream_t s) {
+    if (a.xh == nullptr || a.y == nullptr || a.ldo != a.n_embd) return false;
+    void* tiles = fused_tiles(mmq_rows, a.n_exp);
+    if (tiles == nullptr) return false;
+    strata::prefill::rdna4::experts_down(a.wbase, a.stride, fused_geo(a, (size_t) a.ldx * 2), a.n_exp, a.bounds,
+                                         mmq_host_bounds, tiles, a.xh, a.y, s);
+    return true;
+}
+}  // namespace
+#endif
+
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+    if (fused_wanted(a)) {
+        if (fused_gate_up(a, s)) return true;
+        std::fprintf(stderr, "ds4: the fused prompt experts could not run a set\n");
+        std::abort();   // (its down would read H the FP16 tiles never wrote)
+    }
     if (mmq_wanted(a, true) && mmq_gate_up(a, s)) return true;
 #endif
     if (a.n_embd % 256 != 0 || a.n_ff % BN != 0) return false;
@@ -1822,6 +1939,11 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 
 bool set_down(const SetArgs& a, cudaStream_t s) {
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+    if (fused_wanted(a)) {
+        if (fused_down(a, s)) return true;
+        std::fprintf(stderr, "ds4: the fused prompt experts could not run a set's down\n");
+        std::abort();   // (H is int8 here: the FP16 tiles cannot read it)
+    }
     if (mmq_wanted(a, false) && mmq_down(a, s)) return true;
 #endif
     if (a.n_ff % 256 != 0 || a.n_embd % BN != 0) return false;
