@@ -1474,20 +1474,25 @@ def download_dir(models: Path, quant: str) -> Path:
 
 def choose_draft(a, pc: dict, inst: dict) -> str:
     """"mtp" (the model's own MTP block; the default) or "dflash2" (a DFlash2 drafter, downloaded in step 5): --draft,
-    else asked - the earlier setup's answer is the default.  AMD (HIP) setups keep MTP: DFlash2 is measured on NVIDIA.
-    So do NVIDIA GPUs before sm_80 (RTX 30 / A100): on Tesla V100s DFlash2 decoded slower than the MTP block (one GPU
-    and two).  A DFlash2 answer is then checked on this PC by the speed calibration (speed_calibration): it stays only
-    where it is faster."""
+    else asked - the earlier setup's answer is the default.  AMD (HIP) setups keep MTP, except one Ryzen AI Max APU
+    (hip_unified_memory: Strix / Gorgon Halo), where DFlash2 is measured (a Radeon 8060S with every expert in its
+    memory: glm_dflash_test passes; --bench decode +9% against the MTP block, the speed calibration +5%).  So do NVIDIA
+    GPUs before sm_80 (RTX 30 / A100): on Tesla V100s DFlash2 decoded slower than the MTP block (one GPU and two).  A
+    DFlash2 answer is then checked on this PC by the speed calibration (speed_calibration): it stays only where it is
+    faster."""
     if getattr(a, "draft", None):
         return a.draft
-    if pc.get("backend") == "hip":
+    gpus = pc.get("gpus") or []
+    one_apu = pc.get("backend") == "hip" and len(gpus) == 1 and hip_unified_memory(gpus[0])
+    if pc.get("backend") == "hip" and not one_apu:
         return "mtp"
-    if pc.get("archs") and min(int(x) for x in pc["archs"]) < 80:
+    if pc.get("backend") != "hip" and pc.get("archs") and min(int(x) for x in pc["archs"]) < 80:
         return "mtp"
     default = inst.get("draft") if inst.get("draft") in DRAFTS else "mtp"
+    mtp_where = ("It drafts on this one GPU (an APU that holds the model in its memory)." if one_apu else
+                 "On two GPUs or more; one GPU decodes without drafting.")
     rows = [("the model's MTP block", "default",
-             "The model's own draft block guesses the next token, which the model then checks. On two GPUs or "
-             "more; one GPU decodes without drafting."),
+             "The model's own draft block guesses the next token, which the model then checks. " + mtp_where),
             (f"a DFlash2 drafter (download {DFLASH['bytes'] / 1e9:.1f} GB from Hugging Face)", None,
              "A small drafter made for GLM-5.3-Flash drafts up to 7 tokens a round, which the model then checks: the "
              "same answers, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one "
@@ -5877,7 +5882,8 @@ def main() -> int:
                          "minimax-maya-xs / minimax-maya-s)")
     ap.add_argument("--draft", choices=list(DRAFTS),
                     help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
-                         f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")
+                         f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA RTX 30 / A100 and newer, and one AMD "
+                         "Ryzen AI Max APU)")
     ap.add_argument("--no-vision", action="store_true", help="text only: no image encoder (saves its build and "
                                                              "its 1.1 GB of files)")
     ap.add_argument("--gguf-dir", help="use GLM-5.3-Flash GGUF files you already have: the folder with all of them, "

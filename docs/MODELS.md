@@ -51,9 +51,10 @@ On AMD, GLM-5.3-Flash reads text only.
 - **Long contexts:** new setups keep each attention layer's cache in RAM with a window of it in VRAM
   (`--kv-streaming on`; `./maya.sh --setup` adds it to an existing config), so the VRAM holds more experts - at 512K
   on an RTX 3090, prompts 4-9x faster and decode +5%; 1M context fits one 3090 ([how](SETTINGS.md)).
-- **Faster answers with a DFlash2 drafter:** `./maya.sh --setup --draft dflash2` (NVIDIA RTX 30 / A100 and newer)
-  downloads a small drafter that drafts up to 7 tokens a round and gives the same answers - Maya-L +44% on nine GPUs
-  and +12% on two (against the MTP block), +19% on one RTX 3090 ([how](SETTINGS.md#drafting-with-dflash2)). How much
+- **Faster answers with a DFlash2 drafter:** `./maya.sh --setup --draft dflash2` (NVIDIA RTX 30 / A100 and newer,
+  and one AMD Ryzen AI Max APU) downloads a small drafter that drafts up to 7 tokens a round and gives the same answers
+  - Maya-L +44% on nine GPUs and +12% on two (against the MTP block), +19% on one RTX 3090, +9% on a Radeon 8060S
+  with unsloth's UD-IQ2_XXS ([how](SETTINGS.md#drafting-with-dflash2)). How much
   it gains depends on the PC: on one GPU that reads much of the model from RAM it is often slower. So a
   [speed calibration](SETTINGS.md#the-speed-calibration) measures it on your PC and keeps it only where it is faster.
   The drafter's license is non-commercial (CC BY-NC-ND 4.0).

@@ -396,9 +396,10 @@ context shares the memory beside the model among the N conversations.
 
 `./maya.sh --setup --draft dflash2` downloads the drafter (0.7 GB,
 [on Hugging Face](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF); its license is CC BY-NC-ND 4.0:
-non-commercial use only) and passes it as `--dflash GGUF` in the config's `"args"`; NVIDIA GPUs, one request at a time
-(`--parallel 1`). The setup offers it on RTX 30 / A100 and newer (sm_80): on Tesla V100s it decoded slower than the MTP
-block, on one GPU and on two. How much it gains also depends on the PC - where most experts come from RAM, checking
+non-commercial use only) and passes it as `--dflash GGUF` in the config's `"args"`; NVIDIA GPUs and one AMD Ryzen AI
+Max APU, one request at a time (`--parallel 1`). The setup offers it on RTX 30 / A100 and newer (sm_80): on Tesla V100s
+it decoded slower than the MTP block, on one GPU and on two. On AMD it offers it on one Ryzen AI Max APU (Strix / Gorgon
+Halo, gfx1151) - other AMD GPUs, and an APU beside a discrete card, keep the MTP block (not measured there). How much it gains also depends on the PC - where most experts come from RAM, checking
 the drafts can cost more than they save (an RTX 3090 + 3060 with Maya-M, #127) - so the setup measures it there
 ([the speed calibration](#the-speed-calibration)).
 
@@ -451,10 +452,27 @@ One RTX 3090 (the MTP block is not loaded on one GPU: plain decode), and the 309
 | 3090 + 5060 Ti, the MTP block (three runs) | 20.9 | 21.3 | 21.9 | 16.7 | 19.4 | 19.7 |
 | 3090 + 5060 Ti, DFlash2 (three runs) | 23.2 | 24.2 | 25.8 | 19.4 | 19.2 | **22.1 (+12%)** |
 
+One Radeon 8060S (a Ryzen AI MAX+ 395, 108 GB of its memory for the GPU, every expert of unsloth's UD-IQ2_XXS in it;
+there the MTP block drafts on one GPU, `MAYA_GLM_MTP_DECODE`), `./maya.sh --bench` (greedy, up to 256 tokens):
+
+| | code | explanation | HTML | all |
+| --- | --- | --- | --- | --- |
+| the MTP block (three runs) | 27.6 | 25.3 | 29.3 | 27.4 |
+| DFlash2 (three runs) | 30.5 | 26.5 | 32.5 | **29.8 (+9%)** |
+
+Prompts are read at the same speed with either (153-162 tok/s at 2K and 8K tokens). The speed calibration there
+(sampled, after an 8,192-token document): 21.9 against 23.0 tok/s (+5%, at the 5% it needs: run to run it can keep
+either), 87% and 91% of the drafts accepted. With the
+prompt read token by token (`MAYA_GLM_NO_PREFILL=1`), decoding with and without DFlash2 (`"spec": 1`) gave the same
+text on three prompts of 384 tokens, twice each; with the prompt path on, two reads of one prompt can part already
+(it borrows the pool's slots), with or without a drafter. `glm_dflash_test` passes there (0 of 7 picks differ, the
+hidden states' cosine 0.9947 or more).
+
 ### The speed calibration
 
 When the setup drafts with DFlash2 - and once, at the first start after an update, for a config that already drafts
-with it - Maya measures it on your PC against the MTP block (one GPU: against decoding without drafting) and keeps
+with it - Maya measures it on your PC against the MTP block (one GPU: against decoding without drafting - on a Ryzen
+AI Max APU that is the MTP block's one-GPU decode, `MAYA_GLM_MTP_DECODE`) and keeps
 the faster. It loads the model twice, the same config without and with `--dflash`. Each time it reads a long document
 (about 8,000 tokens, the depth of a real conversation) and answers once to warm up - not counted - then answers fresh
 questions about it, sampled as the dashboard samples (the same questions and seeds both times), until about 1,500
