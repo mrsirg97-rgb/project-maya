@@ -1053,6 +1053,11 @@ struct Model::Impl {
     // at a chunk there, never mid-chunk (halt_now), unless a Stop follows
     std::function<bool()> yield_to;
     std::atomic<bool> yielding{false};
+    // a run a yield may end: no device starts chunk k before chunk k - (the stages + kYieldSlack) is through every
+    // layer - the stages all still busy, and the chunks a yield waits for no more than that (a device's host otherwise
+    // runs chunks ahead of its GPU, and its stage ahead of the next: a yield's cut came 5 chunks past the done ones)
+    static constexpr int kYieldSlack = 1;
+    bool run_yields = false;
     int fed_n = 0;   // the last feed's tokens read (fewer than it was given: a yield)
     static constexpr const char* kHalted = "stopped";
     bool past_halt(int k) {   // a Stop came and chunk k is one no device starts
@@ -15393,6 +15398,15 @@ struct Model::Impl {
         std::future<void> eg_next;
         if (!egs.empty() && eg_src == di) eg_next = std::async(std::launch::async, read_eg, 0);
         for (int k = 0; k < nk; ++k) {
+            if (run_yields) {
+                const int back = k - ((int) groups.size() + kYieldSlack);
+                if (back >= 0)
+                    while (!(chunk_rec[(size_t) back].load(std::memory_order_acquire) &&
+                             cudaEventQuery(chunk_done[(size_t) back]) == cudaSuccess)) {
+                        if (eg_abort.load(std::memory_order_acquire) || past_halt(k)) break;
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
+            }
             if (!chunk_go(k)) return halt_end(di, err);   // (a Stop: the chunks every device reaches are done)
             c.at_k.store(k, std::memory_order_relaxed);
             c.at_il.store(-1, std::memory_order_relaxed);
@@ -16510,6 +16524,7 @@ struct Model::Impl {
             halt_seen = -1;
         }
         bool halting = false, stopping = false;
+        run_yields = yield_to != nullptr && !lm && !logits_all;
         eg_abort.store(false);
         if (prefetch) prefetch->start();
         // (DS4_FLOW_HELPER_CHECK: the load's first N runs)

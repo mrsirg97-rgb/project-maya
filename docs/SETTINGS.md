@@ -393,7 +393,11 @@ context shares the memory beside the model among the N conversations.
   request comes: the run then ends at the next chunk every stage reaches and the pieces start. A long prompt's skip
   (`DS4_YOCO`) counts its kept rows from the prompt's end, not each piece's, so a piece before them reads only the
   layers up to the skip, as in the read whole. `MAYA_DS4_READ_PIECE=<n>` makes a piece n chunks a stage (1), and
-  `MAYA_DS4_READ_ROUNDS=<n>` lets the running answers write n tokens each between two pieces (1).
+  `MAYA_DS4_READ_ROUNDS=<n>` lets the running answers write n tokens each between two pieces (1), and
+  `MAYA_DS4_READ_SHARE=<percent>` instead lets them write for that share of the time, their tokens' against the last
+  piece's (a prompt that fits in one piece still goes after one token). A share helps a short answer beside a long
+  read (on 3 GPUs, 20: a 24-token answer beside a 101K read done in 15-30 s, not 56 s) but delays the next long
+  reads, so it is off: in `tools/ds4/agent_bench.py` it made a turn's first token later.
   `MAYA_DS4_READ_ORDER=arrival` reads each prompt whole as it comes, the others waiting (as v1.1.34 did). On 3 GPUs
   (2x RTX 5090 + RTX 3090, GSQ IQ2_XXS, about half the experts in RAM), `tools/ds4/agent_bench.py` - 4 agents x 8
   turns, 4-12K-token first prompts, tool results of 150-2,000 tokens with one in ten of 5-20K: a turn's first token

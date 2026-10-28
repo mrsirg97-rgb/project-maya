@@ -1514,8 +1514,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             return v == nullptr || std::string(v) != "arrival";
         }();
         // MAYA_DS4_READ_PIECE=<chunks>: a piece is that many chunks a pipeline stage (1); MAYA_DS4_READ_ROUNDS=<n>: the
-        // running answers write n tokens each (n rounds) between two pieces (1)
-        constexpr int kReadPieceChunks = 1, kReadRounds = 1;
+        // running answers write n tokens each (n rounds) between two pieces (1); MAYA_DS4_READ_SHARE=<percent>: instead,
+        // they write for that share of the time, their rounds' against the last piece's (a round at least; 0: off)
+        constexpr int kReadPieceChunks = 1, kReadRounds = 1, kReadShareMax = 90;
         const auto env_count = [](const char* name, int dflt) {
             const char* v = std::getenv(name);
             const int x = v != nullptr ? std::atoi(v) : 0;
@@ -1525,6 +1526,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                                              (size_t) env_count("MAYA_DS4_READ_PIECE", kReadPieceChunks)
                                                        : (size_t) m.feed_unit();
         const int read_rounds = env_count("MAYA_DS4_READ_ROUNDS", kReadRounds);
+        const double read_share = std::min(env_count("MAYA_DS4_READ_SHARE", 0), kReadShareMax) / 100.0;
         // the reader's lines posted and taken: one waiting, a prompt read alone yields to it
         std::atomic<long long> lines_posted{0};
         long long lines_taken = 0;
@@ -1686,7 +1688,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         strata::ds4::evt::Engine eng;
         bool quit = false;
         bool turn_queued = false;   // (one turn in the queue at a time: each queues the next as it ends)
-        int rounds = 0;             // (the rounds since the last piece: read_rounds of them, a prompt's piece next)
+        int rounds = 0;             // (the rounds since the last piece, and their time; the last piece's time)
+        double rounds_ms = 0, piece_ms = 0;
+        // (with a share, a prompt whole in one piece next goes after a round: its read is short and its first token
+        //  the one waited for - the share is the answers' between a long read's pieces)
+        const auto piece_due = [&] {
+            if (read_share <= 0) return rounds >= read_rounds;
+            if (rounds > 0 && !read_line.empty() && one_piece(read_line.front())) return true;
+            return rounds > 0 && rounds_ms >= piece_ms * read_share / (1.0 - read_share);
+        };
         const auto admit_waiting = [&] {
             while (!quit && !waiting.empty() && std::find(seq_rid.begin(), seq_rid.end(), -1LL) != seq_rid.end()) {
                 const std::string g = waiting.front();
@@ -1912,7 +1922,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (a->reading && !a->done) read_line.push_back(a);
         };
         std::function<void()> settle;
-        // the next turn: a piece after read_rounds rounds while a prompt is being read, else a round while an answer runs
+        // the next turn: a piece once the rounds since the last one are due (piece_due) while a prompt is being read,
+        // else a round while an answer runs
         const auto queue_turn = [&] {
             if (turn_queued || acts.empty()) return;
             turn_queued = true;
@@ -1920,11 +1931,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 turn_queued = false;
                 const bool answering = std::any_of(acts.begin(), acts.end(),
                                                    [](const std::unique_ptr<Act>& a) { return !a->reading; });
-                if (!read_line.empty() && (rounds >= read_rounds || !answering)) {
+                if (!read_line.empty() && (!answering || piece_due())) {
+                    const double t = now_ms();
                     read_turn_next(answering);
+                    if (answering) piece_ms = now_ms() - t;
                     rounds = 0;
+                    rounds_ms = 0;
                 } else if (answering) {
+                    const double t = now_ms();
                     round_turn();
+                    rounds_ms += now_ms() - t;
                     ++rounds;
                 }
                 settle();
