@@ -128,8 +128,9 @@ public:
     /// Feeds `token` at position pos(); with logits, the next token's logits are left on the head's device.
     bool step(int token, bool logits, std::string& err);
     /// Feeds n tokens (windows of up to 16, or a long run in chunks of prefill_chunk); the last `logits_rows` of them get
-    /// logits (logits_rows > 16: only a run of one chunk or window).
-    bool feed(const int* tokens, int n, int logits_rows, std::string& err);
+    /// logits (logits_rows > 16: only a run of one chunk or window).  `after`: the prompt's tokens still to come in
+    /// later feeds (a piece of it) - a long prompt's skip counts its kept rows from the prompt's end.
+    bool feed(const int* tokens, int n, int logits_rows, std::string& err, int after = 0);
     /// feed() of a prompt's end that also keeps the state before its last token in checkpoint `slot` (a prompt's
     /// last token then rides along in the run of chunks instead of a window of its own); the same as
     /// feed(n - 1), checkpoint(slot), feed(1)
@@ -177,6 +178,11 @@ public:
     /// prompt's start is then not usable: restore() a checkpoint kept before the feed, or reset().
     void set_cancel(std::function<bool()> f);
     bool cancelled() const;   // the last feed() / feed_mark() ended early on a Stop
+    /// Asked while a run of chunks goes through the layers: true (a yield) ends it at a chunk every GPU reaches, as a
+    /// Stop does, but keeps the chunks read - feed() / feed_mark() return true having taken fed() of their tokens (the
+    /// rest a later feed's; feed_mark's checkpoint then not kept).  Not on a run that goes layer by layer.
+    void set_yield(std::function<bool()> f);
+    int fed() const;   // the tokens the last feed() / feed_mark() took (all of them unless a yield)
     /// A request starts (before its prompt): DISK_SKIP_AUTO may switch back on here, never mid-answer.
     void begin_request();
     int64_t pos() const;

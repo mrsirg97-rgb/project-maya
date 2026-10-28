@@ -389,6 +389,11 @@ context shares the memory beside the model among the N conversations.
   longer stops the others' answers for its whole read, and a prompt that fits in one piece goes ahead of the longer
   reads, so a short question does not wait behind them. Each piece is a whole number of the uncut read's chunks, and
   every answer is the one it gets alone (the same checks as above, with pieces). A prompt with pictures is read whole.
+  A prompt read alone - no other prompt being read, no answer running - goes in one run, the pipeline full, until a
+  request comes: the run then ends at the next chunk every stage reaches and the pieces start. A long prompt's skip
+  (`DS4_YOCO`) counts its kept rows from the prompt's end, not each piece's, so a piece before them reads only the
+  layers up to the skip, as in the read whole. `MAYA_DS4_READ_PIECE=<n>` makes a piece n chunks a stage (1), and
+  `MAYA_DS4_READ_ROUNDS=<n>` lets the running answers write n tokens each between two pieces (1).
   `MAYA_DS4_READ_ORDER=arrival` reads each prompt whole as it comes, the others waiting (as v1.1.34 did). On 3 GPUs
   (2x RTX 5090 + RTX 3090, GSQ IQ2_XXS, about half the experts in RAM), `tools/ds4/agent_bench.py` - 4 agents x 8
   turns, 4-12K-token first prompts, tool results of 150-2,000 tokens with one in ten of 5-20K: a turn's first token

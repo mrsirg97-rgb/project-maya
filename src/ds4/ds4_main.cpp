@@ -1243,14 +1243,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const size_t n = std::min<size_t>({(size_t) m.feed_unit(), total - P.done, piece - (P.done - start)});
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = P.done + n == total;
+            size_t took = n;   // (fewer: a yield - the model ended the run early, the rest a later piece's)
             if (fin && last_window) {
                 ok = (n < 2 || m.feed(r.ids.data() + P.done, (int) n - 1, 0, err));
-                if (ok) m.checkpoint(1);
-                ok = ok && m.feed(r.ids.data() + P.done + n - 1, 1, 1, err);
-            } else
+                if (ok && n >= 2 && (size_t) m.fed() < n - 1) took = (size_t) m.fed();
+                else {
+                    if (ok) m.checkpoint(1);
+                    ok = ok && m.feed(r.ids.data() + P.done + n - 1, 1, 1, err);
+                }
+            } else {
                 ok = fin ? m.feed_mark(r.ids.data() + P.done, (int) n, 1, 1, err)
-                         : m.feed(r.ids.data() + P.done, (int) n, 0, err);
-            P.done += n;
+                         : m.feed(r.ids.data() + P.done, (int) n, 0, err, (int) (total - P.done - n));
+                if (ok) took = (size_t) m.fed();
+            }
+            P.done += took;
             beat();
             if (ok && (P.done >= P.next_pp || P.done == total)) {
                 const double ms = now_ms() - t0;
@@ -1259,6 +1265,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::fflush(stdout);
                 P.next_pp = P.done + 64;
             }
+            if (took < n) break;
         }
         m.set_cancel(nullptr);
         m.set_progress(nullptr);
@@ -1467,7 +1474,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // prompts being read take turns, a piece each (a chunk per pipeline stage: the split's stages all busy), and every
     // running request writes a token between two pieces - so a long prompt no longer holds every answer, and a short
     // question no longer waits for a long prompt read before it: a prompt whole in one piece goes ahead of the longer
-    // reads (MAYA_DS4_READ_ORDER=arrival: each prompt whole as it comes, the others waiting).  A prompt with pictures is
+    // reads (MAYA_DS4_READ_ORDER=arrival: each prompt whole as it comes, the others waiting).  A prompt read alone goes
+    // in one run until a line comes (Model::set_yield: the run ends at a chunk every stage reaches), and a piece tells
+    // the model how much of its prompt follows (the long prompt's skip counts from the prompt's end).  A prompt with pictures is
     // read whole (the tower borrows its room and gives it back before the prompt, with every other request between
     // two of its tokens).  A request alone decodes in its rounds as with one conversation (DSpark's drafts, the prompt
     // lookup); two or more in rounds together - each one's DSpark drafts (its share of a window), every one's token
@@ -1504,8 +1513,21 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const char* v = std::getenv("MAYA_DS4_READ_ORDER");
             return v == nullptr || std::string(v) != "arrival";
         }();
-        const size_t read_piece = m.prompt_chunk() > 0 ? (size_t) m.prompt_chunk() * (size_t) m.pipeline_stages()
+        // MAYA_DS4_READ_PIECE=<chunks>: a piece is that many chunks a pipeline stage (1); MAYA_DS4_READ_ROUNDS=<n>: the
+        // running answers write n tokens each (n rounds) between two pieces (1)
+        constexpr int kReadPieceChunks = 1, kReadRounds = 1;
+        const auto env_count = [](const char* name, int dflt) {
+            const char* v = std::getenv(name);
+            const int x = v != nullptr ? std::atoi(v) : 0;
+            return x > 0 ? x : dflt;
+        };
+        const size_t read_piece = m.prompt_chunk() > 0 ? (size_t) m.prompt_chunk() * (size_t) m.pipeline_stages() *
+                                                             (size_t) env_count("MAYA_DS4_READ_PIECE", kReadPieceChunks)
                                                        : (size_t) m.feed_unit();
+        const int read_rounds = env_count("MAYA_DS4_READ_ROUNDS", kReadRounds);
+        // the reader's lines posted and taken: one waiting, a prompt read alone yields to it
+        std::atomic<long long> lines_posted{0};
+        long long lines_taken = 0;
         long long lk_owner = -1;           // the request the prompt lookup's history follows (its rounds alone)
         // the Monitor's counters: over everything written since the engine was last idle
         double busy_t1 = 0;
@@ -1564,11 +1586,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             penalties(a.r);
             a.tok = m.sample(a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed, a.counter++);
         };
-        // the next `piece` tokens of its prompt into its conversation (a STOP ends it here, its DONE written)
-        const auto read_turn = [&](Act& a, size_t piece) {
+        // the next `piece` tokens of its prompt into its conversation (a STOP ends it here, its DONE written); `yield`:
+        // the piece ends early at a chunk the model reaches once a line is waiting
+        const auto read_turn = [&](Act& a, size_t piece, bool yield) {
             bind(a.seq);
             const long long rid = a.r.rid;
-            if (!prompt_piece(a.r, " " + std::to_string(rid), [&in, rid] { return in.stopped(rid); }, a.P, piece)) {
+            if (yield) m.set_yield([&] { return lines_posted.load(std::memory_order_acquire) != lines_taken; });
+            const bool read = prompt_piece(a.r, " " + std::to_string(rid), [&in, rid] { return in.stopped(rid); }, a.P,
+                                           piece);
+            m.set_yield(nullptr);
+            if (!read) {
                 a.ended = a.done = true;
                 return;
             }
@@ -1635,7 +1662,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             a->seq = best;
             a->reading = true;
             if (!read_pieces || !a->P.pics.empty()) {
-                read_turn(*a, r.ids.size());
+                read_turn(*a, r.ids.size(), false);
                 if (a->ended) {
                     in.forget(rid);
                     return;
@@ -1659,7 +1686,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         strata::ds4::evt::Engine eng;
         bool quit = false;
         bool turn_queued = false;   // (one turn in the queue at a time: each queues the next as it ends)
-        bool read_next = false;     // (a round was the last turn: a prompt's piece goes next, if one is being read)
+        int rounds = 0;             // (the rounds since the last piece: read_rounds of them, a prompt's piece next)
         const auto admit_waiting = [&] {
             while (!quit && !waiting.empty() && std::find(seq_rid.begin(), seq_rid.end(), -1LL) != seq_rid.end()) {
                 const std::string g = waiting.front();
@@ -1874,15 +1901,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
             }
         };
-        // the next prompt in line reads a piece (its first token picked once it is all read), then goes to the back
-        const auto read_turn_next = [&] {
+        // the next prompt in line reads a piece (its first token picked once it is all read), then goes to the back.
+        // Alone - no other prompt read, no answer running - the rest of it in one run, the pipeline full throughout,
+        // until a line comes (a request: the run ends at the next chunk all stages reach, and pieces again)
+        const auto read_turn_next = [&](bool answering) {
             Act* a = read_line.front();
             read_line.pop_front();
-            if (!a->done) read_turn(*a, read_piece);
+            const bool alone = read_line.empty() && !answering;
+            if (!a->done) read_turn(*a, alone ? a->r.ids.size() : read_piece, alone);
             if (a->reading && !a->done) read_line.push_back(a);
         };
         std::function<void()> settle;
-        // the next turn: a piece after a round while a prompt is being read, else a round while an answer runs
+        // the next turn: a piece after read_rounds rounds while a prompt is being read, else a round while an answer runs
         const auto queue_turn = [&] {
             if (turn_queued || acts.empty()) return;
             turn_queued = true;
@@ -1890,12 +1920,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 turn_queued = false;
                 const bool answering = std::any_of(acts.begin(), acts.end(),
                                                    [](const std::unique_ptr<Act>& a) { return !a->reading; });
-                if (!read_line.empty() && (read_next || !answering)) {
-                    read_turn_next();
-                    read_next = false;
+                if (!read_line.empty() && (rounds >= read_rounds || !answering)) {
+                    read_turn_next(answering);
+                    rounds = 0;
                 } else if (answering) {
                     round_turn();
-                    read_next = true;
+                    ++rounds;
                 }
                 settle();
             }, kTurn);
@@ -1904,7 +1934,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // requests ended (their conversations to the requests waiting), then the next turn - or, none running, idle
         settle = [&] {
             for (auto& ap : acts)
-                if (ap->reading && !ap->done && in.stopped(ap->r.rid)) read_turn(*ap, 0);
+                if (ap->reading && !ap->done && in.stopped(ap->r.rid)) read_turn(*ap, 0, false);
             bool freed = false;
             for (size_t i = 0; i < acts.size();) {
                 if (!acts[i]->done) {
@@ -1935,6 +1965,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // a line: a request (admitted when a conversation is free), QUIT (every request stopped, the engine's end once
         // they are), anything else answered at once (STOP <rid> is the reader's)
         const auto on_line = [&](const std::string& ln) {
+            ++lines_taken;
             g_busy.store(true);
             beat();
             if (ln == "QUIT") {
@@ -1955,9 +1986,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             bool quit_seen = false;
             while (!quit_seen && in.next(l)) {
                 quit_seen = l == "QUIT";
+                lines_posted.fetch_add(1, std::memory_order_release);
                 eng.add([&, l] { on_line(l); }, kLine);
             }
-            if (!quit_seen) eng.add([&] { on_line("QUIT"); }, kLine);
+            if (!quit_seen) {
+                lines_posted.fetch_add(1, std::memory_order_release);
+                eng.add([&] { on_line("QUIT"); }, kLine);
+            }
         });
         eng.run();
         reader.join();
