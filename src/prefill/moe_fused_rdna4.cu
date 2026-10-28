@@ -636,7 +636,7 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
 } // namespace
 
 namespace {
-struct DeviceInfo { bool ready = false, ok = false; int sms = 0; };
+struct DeviceInfo { bool ready = false, ok = false, halo = false; int sms = 0; };
 DeviceInfo device_info() {
     static DeviceInfo devices[32];
     static std::mutex lock;
@@ -659,6 +659,7 @@ DeviceInfo device_info() {
         (void) cudaGetLastError(); return d;
     }
     d.ok = fa.sharedSizeBytes >= (size_t) 2 * NW_ROWS * WLD;
+    d.halo = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
     ck(cudaDeviceGetAttribute(&d.sms, hipDeviceAttributeMultiprocessorCount, dev), "sms");
     return d;
 }
@@ -699,9 +700,12 @@ void experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int ne,
     int ntiles = 0;
     for (int e = 0; e < ne; ++e) ntiles += (host_bounds[e+1] - host_bounds[e] + 63) / 64;
     if (!ntiles) return;
-    const int gu_blocks = geo.gu_type == T_IQ2_S || geo.gu_type == T_IQ2_XS ? 3 : 4;
+    // blocks a multiprocessor, measured (hip_prefill_fused_bench): gfx1151 3 for every pair (Radeon 8060S, 9K-token
+    // layer, IQ2_XXS/IQ3_XXS: 184 -> 155 ms; 4 and 5 are slower, 6 between them); elsewhere 3 for IQ2_S / IQ2_XS, else 4
+    const int gu_blocks = d.halo || geo.gu_type == T_IQ2_S || geo.gu_type == T_IQ2_XS ? 3 : 4;
+    const int dn_blocks = d.halo || geo.d_type == T_IQ2_S ? 3 : 4;
     const unsigned grid_gu = (unsigned) std::min(ntiles * 32, sms * gu_blocks);
-    const unsigned grid_dn = (unsigned) std::min(ntiles * 32, sms * (geo.d_type == T_IQ2_S ? 3 : 4));
+    const unsigned grid_dn = (unsigned) std::min(ntiles * 32, sms * dn_blocks);
     const auto s = (cudaStream_t) stream;
     auto* tiles = (int2*) tile_scratch;
     make_tiles_kernel<<<1, 256, 0, s>>>(bounds, ne, tiles);
